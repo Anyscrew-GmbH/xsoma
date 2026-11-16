@@ -42,6 +42,7 @@ class Config:
     """Every training option; each field is also a command-line flag of the same name. The defaults are the published ones."""
 
     # task and simulator (sim.SimCfg)
+    robot_dir: str = task.ROBOT_DIR or ""  # another robot's directory (task.py); "": the G1
     num_envs: int = 4096
     terrain: str = "mix"  # mix: Holosoma's terrain_locomotion_mix | plane
     terrain_scale: float = 0.5  # Holosoma's terrain scale factor; 0.5 as in its MuJoCo Warp runs (1.0 trains too, see scene.py)
@@ -420,6 +421,8 @@ def main(argv=None):
     """Train for `minutes`, log every `log_every` iterations and save checkpoints, then evaluate every checkpoint."""
     t_launch = time.time()  # the wall clock of a comparison counts from here (start-up and compilation included)
     cfg = parse(argv)
+    # the robot is read when xsoma.task is imported: train.py passes the flag on in time, other entry points set the variable
+    assert cfg.robot_dir == (task.ROBOT_DIR or ""), "--robot_dir needs train.py, or XSOMA_ROBOT_DIR set to the same directory"
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]
     if flags:  # XLA reads XLA_FLAGS when its backend starts, so they are set before XSoma(cfg) first uses the GPU
         os.environ["XLA_FLAGS"] = " ".join([os.environ.get("XLA_FLAGS", "")] + flags).strip()

@@ -14,7 +14,9 @@ contact points and ankle-roll links). The simulator fills it from MuJoCo's kinem
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
+import os
 from typing import NamedTuple
 
 import jax
@@ -22,15 +24,31 @@ import jax.numpy as jnp
 import numpy as np
 
 # ------------------------------------------------------------------ robot and control (spec 1.4-1.6)
-DOF = ("left_hip_pitch", "left_hip_roll", "left_hip_yaw", "left_knee", "left_ankle_pitch", "left_ankle_roll",
+# Another robot: the environment variable XSOMA_ROBOT_DIR (train.py --robot_dir) names a directory with robot.xml (the MJCF,
+# scene.py) and robot.json, whose values replace the G1's wherever a constant below is wrapped in `_robot` (README, Another robot)
+ROBOT_DIR = os.environ.get("XSOMA_ROBOT_DIR")
+if ROBOT_DIR:
+    with open(os.path.join(ROBOT_DIR, "robot.json")) as _f:
+        _ROBOT = json.load(_f)
+
+
+def _robot(key, g1):
+    """The value of `key` in robot.json, in the type of the G1's value: a tuple of names, a float32 array or a scalar."""
+    if not ROBOT_DIR:
+        return g1
+    v = _ROBOT[key]
+    return tuple(v) if isinstance(g1, tuple) else np.asarray(v, np.float32) if isinstance(v, list) else v
+
+
+DOF = _robot("dof", ("left_hip_pitch", "left_hip_roll", "left_hip_yaw", "left_knee", "left_ankle_pitch", "left_ankle_roll",
        "right_hip_pitch", "right_hip_roll", "right_hip_yaw", "right_knee", "right_ankle_pitch", "right_ankle_roll",
        "waist_yaw", "waist_roll", "waist_pitch",
        "left_shoulder_pitch", "left_shoulder_roll", "left_shoulder_yaw", "left_elbow", "left_wrist_roll", "left_wrist_pitch", "left_wrist_yaw",
        "right_shoulder_pitch", "right_shoulder_roll", "right_shoulder_yaw", "right_elbow", "right_wrist_roll", "right_wrist_pitch",
-       "right_wrist_yaw")  # fmt: skip
+       "right_wrist_yaw"))  # fmt: skip
 J = len(DOF)
 LEG = np.asarray([-0.312, 0.0, 0.0, 0.669, -0.363, 0.0])
-DEFAULT_Q = np.concatenate([LEG, LEG, np.zeros(3), [0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0], [0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0]]).astype(np.float32)
+DEFAULT_Q = _robot("default_q", np.concatenate([LEG, LEG, np.zeros(3), [0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0], [0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0]]).astype(np.float32))
 
 # (kp, kd) of each motor type, from its armature I: kp = I w^2, kd = 2 zeta I w, with w = 2 pi 10 rad/s and zeta = 2 (spec 1.5)
 _HIP_P = (40.179238471, 2.557889765)
@@ -42,21 +60,22 @@ _WRIST = (16.778327481, 1.068141502)
 _LEG_GAINS = [_HIP_P, _HIP_R, _HIP_P, _HIP_R, _ANKLE, _ANKLE]
 _ARM_GAINS = [_ARM, _ARM, _ARM, _ARM, _ARM, _WRIST, _WRIST]
 _GAINS = _LEG_GAINS * 2 + [_HIP_P, _ANKLE, _ANKLE] + _ARM_GAINS * 2  # waist yaw like hip_pitch, roll / pitch like ankles
-KP = np.asarray([g[0] for g in _GAINS], np.float32)
-KD = np.asarray([g[1] for g in _GAINS], np.float32)
+KP = _robot("kp", np.asarray([g[0] for g in _GAINS], np.float32))
+KD = _robot("kd", np.asarray([g[1] for g in _GAINS], np.float32))
 # torque limits (N m) in Holosoma's config; the MJCF's motors clamp the hip roll to 88 on top of this (see sim.py)
-EFFORT = np.asarray([88, 139, 88, 139, 50, 50] * 2 + [88, 50, 50] + [25, 25, 25, 25, 25, 5, 5] * 2, np.float32)
-ACTION_SCALE, ACTION_CLIP = 0.25, 100.0  # joint target = DEFAULT_Q + ACTION_SCALE * action; the action is clipped first
+EFFORT = _robot("effort", np.asarray([88, 139, 88, 139, 50, 50] * 2 + [88, 50, 50] + [25, 25, 25, 25, 25, 5, 5] * 2, np.float32))
+# joint target = DEFAULT_Q + ACTION_SCALE * action (a robot file may give one scale per joint); the action is clipped first
+ACTION_SCALE, ACTION_CLIP = _robot("action_scale", 0.25), 100.0
 SIM_DT, DECIMATION = 0.005, 4  # physics step, and physics steps per policy step
 DT = SIM_DT * DECIMATION  # 50 Hz policy
 MAX_EPISODE = 1000  # time-out once the step counter exceeds it: an un-terminated episode has 1001 policy steps (spec 1.6)
 
 # bodies of the compiled scene (prefix "robot_"): frames the task reads and the bodies whose ground contact ends an episode
-FOOT_POINTS = ("left_foot_contact_point", "right_foot_contact_point")
-FEET = ("left_ankle_roll_link", "right_ankle_roll_link")
-TERMINATION_BODIES = ("pelvis", "left_hip_pitch_link", "left_hip_roll_link", "left_hip_yaw_link", "right_hip_pitch_link",
+FOOT_POINTS = _robot("foot_points", ("left_foot_contact_point", "right_foot_contact_point"))
+FEET = _robot("feet", ("left_ankle_roll_link", "right_ankle_roll_link"))
+TERMINATION_BODIES = _robot("termination_bodies", ("pelvis", "left_hip_pitch_link", "left_hip_roll_link", "left_hip_yaw_link", "right_hip_pitch_link",
                       "right_hip_roll_link", "right_hip_yaw_link", "left_shoulder_pitch_link", "left_shoulder_roll_link",
-                      "left_shoulder_yaw_link", "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link")  # fmt: skip
+                      "left_shoulder_yaw_link", "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link"))  # fmt: skip
 CONTACT_FORCE = 1.0  # N: a net contact force above this on a termination body ends the episode (spec 7)
 
 
@@ -74,7 +93,7 @@ class Robot(NamedTuple):
 
 def torques(q, qd, a_applied, kp_scale, kd_scale):
     """PD torques of one 5 ms physics substep (spec 1.5): kp_scale * KP * (target - q) - kd_scale * KD * qd, clipped to the
-    effort limits. The joint target is q0 + 0.25 a, with q0 the default pose."""
+    effort limits. The joint target is q0 + 0.25 a (ACTION_SCALE), with q0 the default pose."""
     tau = kp_scale * KP * (ACTION_SCALE * a_applied + DEFAULT_Q - q) - kd_scale * KD * qd
     return jnp.clip(tau, -EFFORT, EFFORT)
 
@@ -122,7 +141,7 @@ def swing_height(phi, height: float = 0.09):
 
 # ------------------------------------------------------------------ observations (spec 3)
 GRAVITY = np.asarray([0.0, 0.0, -1.0], np.float32)
-ACTOR_DIM, CRITIC_DIM = 100, 103
+ACTOR_DIM, CRITIC_DIM = 3 * J + 13, 3 * J + 16  # 100 and 103 for the G1's 29 joints
 # the terms of the actor observation in order, with their sizes (Holosoma sorts its observation terms alphabetically)
 ACTOR_LAYOUT = (("actions", J), ("base_ang_vel", 3), ("command_ang_vel", 1), ("command_lin_vel", 2), ("cos_phase", 2), ("dof_pos", J),
                 ("dof_vel", J), ("projected_gravity", 3), ("sin_phase", 2))  # fmt: skip
@@ -160,7 +179,7 @@ def observations(robot: Robot, a_last, cmd, phase, key=None):
 
 # ------------------------------------------------------------------ rewards (spec 6)
 # weight of each joint's squared offset from the default pose, in DOF order: the six leg joints twice, then 3 waist, 14 arm joints
-POSE_W = np.asarray([0.01, 1.0, 5.0, 0.01, 5.0, 5.0] * 2 + [50.0] * 3 + [50.0] * 14, np.float32)
+POSE_W = _robot("pose_w", np.asarray([0.01, 1.0, 5.0, 0.01, 5.0, 5.0] * 2 + [50.0] * 3 + [50.0] * 14, np.float32))
 # the terms whose weights the penalty curriculum scales
 PENALTIES = ("ang_vel_xy", "orientation", "action_rate", "pose", "close_feet_xy", "feet_ori")
 
@@ -256,9 +275,10 @@ def curriculum_step(cfg: CurriculumCfg, scale, avg_len, finished_lengths, finish
 
 # ------------------------------------------------------------------ domain randomization (spec 9)
 # "setup only": drawn once per env when the simulator is built; the others are redrawn at every reset or on a schedule
-MASS_BODIES = ("pelvis", "left_hip_yaw_link", "left_hip_roll_link", "left_hip_pitch_link", "left_knee_link",
-               "right_hip_yaw_link", "right_hip_roll_link", "right_hip_pitch_link", "right_knee_link")  # fmt: skip
+MASS_BODIES = _robot("mass_bodies", ("pelvis", "left_hip_yaw_link", "left_hip_roll_link", "left_hip_pitch_link", "left_knee_link",
+                                    "right_hip_yaw_link", "right_hip_roll_link", "right_hip_pitch_link", "right_knee_link"))  # fmt: skip
 MASS_SCALE = (0.9, 1.2)  # the masses of MASS_BODIES times U, inertia scaled by the same ratio (setup only)
+TORSO = _robot("torso", "torso_link")  # the body of the next two
 TORSO_ADDED_MASS = (-1.0, 3.0)  # kg on torso_link (setup only)
 TORSO_COM = 0.05  # +-m per axis on torso_link (setup only)
 FRICTION = (0.5, 1.25)  # range of the friction coefficient; each env gets one of 64 equally spaced values (setup only)
@@ -269,7 +289,7 @@ PUSH_INTERVAL = (5.0, 10.0)  # s between pushes, per env; a push overwrites the 
 PUSH_VEL = 1.0
 
 # ------------------------------------------------------------------ resets (spec 8)
-SPAWN_HEIGHT = 0.8  # pelvis height above the tile origin (the terrain at the spawn point is not looked up)
+SPAWN_HEIGHT = _robot("spawn_height", 0.8)  # pelvis height above the tile origin (the terrain at the spawn point is not looked up)
 SPAWN_XY = 1.0  # U[-1, 1] m offset from the tile origin
 SPAWN_VEL = 0.5  # all six root velocities U[-0.5, 0.5] (world frame)
 SPAWN_Q = (0.5, 1.5)  # q = q0 * U, joints with q0 = 0 start at 0; qd = 0

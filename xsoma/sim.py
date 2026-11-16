@@ -149,9 +149,10 @@ def unflatten(qpos, qvel):
     return qpos[..., :3], R, qvel[..., :3], mv3(R, qvel[..., 3:6]), qpos[..., 7:], qvel[..., 6:]
 
 
-def _points(m: mujoco.MjModel, geoms, frames):
+def _points(m: mujoco.MjModel, geoms, frames, bottom: bool):
     """Reduce geoms to points with a radius, so that a point's height over the terrain minus its radius tells how far the geom
-    is above the terrain there: a sphere is its center, a capsule its two end centers, a box its four bottom corners (radius 0).
+    is above the terrain there: a sphere is its center, a capsule its two end centers, a box its corners (radius 0): the four
+    bottom ones with `bottom` (a sole), else all eight (a falling body may land on any of them).
     Returns the points in their body frames, the index of each point's body in `frames`, and the radii."""
     local, frame, radius = [], [], []
     for g in geoms:
@@ -162,7 +163,7 @@ def _points(m: mujoco.MjModel, geoms, frames):
         elif kind == mujoco.mjtGeom.mjGEOM_CAPSULE:
             pts, r = [pos + s * size[1] * R[:, 2] for s in (1, -1)], size[0]
         elif kind == mujoco.mjtGeom.mjGEOM_BOX:
-            pts, r = [pos + R @ (np.asarray([sx, sy, -1.0]) * size) for sx in (1, -1) for sy in (1, -1)], 0.0
+            pts, r = [pos + R @ (np.asarray([sx, sy, sz]) * size) for sz in ((-1,) if bottom else (-1, 1)) for sx in (1, -1) for sy in (1, -1)], 0.0
         else:
             raise ValueError(f"collider geom {m.geom(g).name} has unsupported type {kind}")
         local += pts
@@ -207,11 +208,11 @@ class Sim:
         # the bodies whose poses forward kinematics returns: the two foot contact points, the two ankle-roll links (the task's own
         # frames, in this order), then the bodies of the termination colliders
         frames = [m.body(f"robot_{b}").id for b in task.FOOT_POINTS + task.FEET] + [int(m.geom_bodyid[g]) for g in tg]
-        self.coll_local, self.coll_frame, self.coll_radius = _points(m, tg, frames)
-        self.sole_local, self.sole_frame, self.sole_radius = _points(m, sole_geoms, frames)
+        self.coll_local, self.coll_frame, self.coll_radius = _points(m, tg, frames, bottom=False)
+        self.sole_local, self.sole_frame, self.sole_radius = _points(m, sole_geoms, frames, bottom=True)
         self.kin = Kinematics(m, [m.body(b).name for b in frames])
         self.mass_ids = np.asarray([m.body(f"robot_{b}").id for b in task.MASS_BODIES])
-        self.torso = m.body("robot_torso_link").id
+        self.torso = m.body(f"robot_{task.TORSO}").id
 
         self.mx = mjx.put_model(m, impl="warp")
         self.dx = mjx.make_data(m, impl="warp", naconmax=N * c.nconmax, njmax=c.njmax, naccdmax=N * (c.naccdmax or c.nconmax))

@@ -40,8 +40,10 @@ import numpy as np
 from . import terrain as terrain_mod
 
 # Holosoma's G1 MJCF, unmodified; the environment variable XSOMA_G1_XML overrides the path. Its visual meshes (assets/meshes,
-# tools/download_meshes.sh) are only loaded with visual=True.
-G1_XML = os.environ.get("XSOMA_G1_XML") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "g1_29dof.xml")
+# tools/download_meshes.sh) are only loaded with visual=True. With XSOMA_ROBOT_DIR set (task.py), the MJCF is its robot.xml.
+_ROBOT_DIR = os.environ.get("XSOMA_ROBOT_DIR")
+_XML = os.path.join(_ROBOT_DIR, "robot.xml") if _ROBOT_DIR else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "g1_29dof.xml")
+G1_XML = os.environ.get("XSOMA_G1_XML") or _XML
 
 FLOOR = {"friction": [0.7, 0.005, 0.001], "solimp": [0.99, 0.99, 0.01, 0.5, 2], "solref": [0.001, 1]}  # Holosoma's terrain geom
 # Holosoma's explicit sole-floor pairs; friction is (sliding twice, torsional, rolling twice), as in MuJoCo's <pair>

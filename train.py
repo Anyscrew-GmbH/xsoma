@@ -2,12 +2,14 @@
 
     python train.py --log_dir runs/xsoma            # 15 minutes of training (--minutes), then every checkpoint is evaluated
     python train.py --layout AL --log_dir runs/x4   # 2 or more GPUs: GPU 0 collects, the others update the policy (xsoma/multi_gpu.py)
+    python train.py --robot_dir <dir> ...           # another robot: <dir>/robot.xml and <dir>/robot.json (README, Another robot)
 
 Every option of xsoma/train.py's Config is a flag (--name value); the defaults are the published H100 configuration.
 Checkpoints, log.jsonl, config.json and eval.jsonl go to --log_dir.
 """
 
 import os
+import sys
 
 
 def runtime_defaults():
@@ -15,6 +17,8 @@ def runtime_defaults():
     memory up front, and compiled programs carry no Python tracebacks (so the programs in the compilation cache are smaller)."""
     os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
     os.environ.setdefault("JAX_INCLUDE_FULL_TRACEBACKS_IN_LOCATIONS", "false")
+    if "--robot_dir" in sys.argv:  # xsoma.task reads the robot when it is imported, so the flag becomes its environment variable
+        os.environ["XSOMA_ROBOT_DIR"] = sys.argv[sys.argv.index("--robot_dir") + 1]
 
 
 if __name__ == "__main__":

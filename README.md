@@ -214,6 +214,24 @@ or checkpoint, XSoma's or Holosoma's:
 python -m xsoma.evaluate runs/xsoma         # 2048 robots, one 20-s episode each, per checkpoint
 ```
 
+### Another robot
+
+A robot other than the G1 is a directory with two files, given as `python train.py --robot_dir <dir>`. The other entry points
+(`xsoma.evaluate`, the tools) read it from the environment variable `XSOMA_ROBOT_DIR`. The task stays Holosoma's.
+
+- `robot.xml`: the robot alone as an MJCF with the conventions of Holosoma's G1 file. Body 1 is the free-floating base; every
+  other joint is a hinge at its body's origin, at most one per body, named `<name>_joint`. One torque motor per joint, in joint
+  order, with the torque limit as its `ctrlrange`. Colliders are spheres, capsules or boxes with `contype="1" conaffinity="1"`
+  (they collide with the terrain only), one per termination body. Each sole geom has a `<pair>` with a geom named `floor`,
+  which marks it as a sole, and each foot has a body at the middle of the sole's underside, where the task reads its height.
+- `robot.json`: the robot's values of the task, which replace the G1's in [`xsoma/task.py`](xsoma/task.py) (the constants
+  wrapped in `_robot`): `dof` (the joint names without `_joint`, in the MJCF's order), `default_q`, `kp`, `kd`, `effort` and
+  `pose_w` (one number per joint), `action_scale` (one number, or one per joint), `foot_points`, `feet`, `termination_bodies`
+  and `mass_bodies` (body names), `torso` (the body with the added mass) and `spawn_height`.
+
+The PD law is explicit at the 5 ms physics step, so every joint needs 2 kd h / I + kp h² / I < 4 (h the step, I the joint's
+inertia, at least its armature); a joint beyond that chatters between its torque limits. `--foot box` is the G1's box foot.
+
 Holosoma's baselines, in Holosoma's own environment (its MuJoCo Warp setup), for 15 minutes of training plus start-up:
 
 ```bash
@@ -229,6 +247,7 @@ Checks, figures and the GIF:
 JAX_PLATFORMS=cpu python tests/test_task_holosoma.py   # XSoma's task against Holosoma's environment (recorded in tests/data)
 JAX_PLATFORMS=cpu python tests/test_scene.py           # priority contacts against explicit pairs, tiles against one height map
 JAX_PLATFORMS=cpu python tests/test_multi_gpu.py       # the multi-GPU learners against the 1-GPU update (4 emulated devices)
+JAX_PLATFORMS=cpu python tests/test_robot_dir.py       # the G1 given as a robot directory against the built-in G1
 python tools/check_sim.py                              # kinematics, terrain heights and contact forces against MuJoCo (GPU)
 python tools/check_heads.py                            # imagination's rewards and terminations against the simulator's (GPU)
 python tools/stress_sim.py                             # physics failures under hard random actions, per terrain layout (GPU)
