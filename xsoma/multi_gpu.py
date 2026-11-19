@@ -145,6 +145,7 @@ def run(cfg, t_launch):
     devs = jax.devices()
     L = cfg.learners or len(devs) - 1
     assert cfg.layout == "AL", f"unknown layout {cfg.layout!r} (1GPU | AL)"
+    assert not cfg.init_tracker, "--init_tracker needs --layout 1GPU: the learners' message does not carry a tracker's history"
     assert 1 <= L <= len(devs) - 1, f"layout AL with {L} learners needs {L + 1} GPUs, found {len(devs)}"
     rounds = math.ceil(cfg.pi_updates / L)
     devA, devL = devs[0], devs[1 : L + 1]

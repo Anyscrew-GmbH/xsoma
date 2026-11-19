@@ -25,6 +25,9 @@ The simulator clips actions at +-100 (task.ACTION_CLIP) and does not squash them
 
 The forward pass (`act`) is XMimic's policy (xmimic/nets.py, pi_encode and pi_apply; MIT, by the same author), copied here so
 that XSoma does not import XMimic.
+
+train.py fine-tunes the encoder and the decoder on the task (`--init_tracker`, with the normalizers as loaded) and writes its
+checkpoints in the layout read here, the live policy next to the averaged one under the prefix `live.`.
 """
 
 from __future__ import annotations
@@ -43,10 +46,11 @@ CMD = np.asarray((9, 10, 14))  # v x, v y, w z in a goal frame
 Z = np.asarray([0.0, 0.0, 1.0], np.float32)
 
 
-def load(ckpt, meta):
+def load(ckpt, meta, prefix=""):
     """The tracker as one pytree of arrays, from a checkpoint as XMimic writes it and the tracker's robot description: `enc` and
     `dec` (layers), `obs_norm` and `goal_norm` (the normalizers, frozen), `q0` and `alpha` (default pose and action scale in the
-    tracker's joint order), `to_tracker` (x_tracker = x_sim[..., to_tracker]) and `to_sim`, its inverse."""
+    tracker's joint order), `to_tracker` (x_tracker = x_sim[..., to_tracker]) and `to_sim`, its inverse. `prefix` "live." reads
+    the live policy of a checkpoint that train.py wrote."""
     z = np.load(ckpt)
     args = json.loads(str(z["meta"]))["args"]
     assert args.get("goal_mask_share", 0.0) > 0, f"{ckpt} was trained without goal masking: it does not accept a command-only goal"
@@ -61,7 +65,7 @@ def load(ckpt, meta):
         bad = np.nonzero(np.abs(a - b) > 1e-5)[0]
         assert not len(bad), f"the {what} of the tracker and of the robot differ at {[names[i] for i in bad]}: {a[bad]} and {b[bad]}"
     J, K, H = task.J, args["goal_frames"], args["hist"]
-    p = {net: [{k: jnp.asarray(z[f"{net}.{i}.{k}"]) for k in ("w", "b")} for i in range(sum(f.startswith(net + ".") and f.endswith(".w") for f in z.files))]
+    p = {net: [{k: jnp.asarray(z[f"{prefix}{net}.{i}.{k}"]) for k in ("w", "b")} for i in range(sum(f.startswith(prefix + net + ".") and f.endswith(".w") for f in z.files))]
          for net in ("enc", "dec")}  # fmt: skip
     p |= {n: {k: jnp.asarray(z[f"{n}.{k}"]) for k in ("mean", "var")} for n in ("obs_norm", "goal_norm")}
     sizes = (p["enc"][0]["w"].shape[0], p["dec"][0]["w"].shape[0], p["dec"][-1]["w"].shape[1])
@@ -88,14 +92,14 @@ def goal(p, cmd):
     return jnp.concatenate((g.reshape(cmd.shape[:-1] + (-1,)), jnp.ones(cmd.shape[:-1] + (1,))), -1)
 
 
-def act(p, hist, g):
+def act(p, hist, g, out_bf16=False):
     """The tracker's action (its joint order) for the observation histories (..., H, 3 J + 12) and the goals g:
     decoder(tanh(encoder(g)), history) + (the goal's next joint positions - q0) / alpha. The last term is zero for a
-    command-only goal."""
+    command-only goal. `out_bf16`: see nets.mlp_apply."""
     J = p["q0"].shape[0]
-    z = jnp.tanh(nets.mlp_apply(p["enc"], nets.rn_apply(p["goal_norm"], g), jax.nn.elu))
+    z = jnp.tanh(nets.mlp_apply(p["enc"], nets.rn_apply(p["goal_norm"], g), jax.nn.elu, out_bf16=out_bf16))
     o = nets.rn_apply(p["obs_norm"], hist).reshape(hist.shape[:-2] + (-1,))
-    return nets.mlp_apply(p["dec"], jnp.concatenate((z, o), -1), jax.nn.elu) + (g[..., FRAME : FRAME + J] - p["q0"]) / p["alpha"]
+    return nets.mlp_apply(p["dec"], jnp.concatenate((z, o), -1), jax.nn.elu, out_bf16=out_bf16) + (g[..., FRAME : FRAME + J] - p["q0"]) / p["alpha"]
 
 
 def memory(p, n):
@@ -117,3 +121,14 @@ def step(p, mem, s):
     hist = jnp.where(fresh[:, None, None], o[:, None], jnp.concatenate((mem["hist"][:, 1:], o[:, None]), 1))
     a = act(p, hist, goal(p, s.cmd))
     return a[:, p["to_sim"]], {"hist": hist, "heading": heading + task.DT * s.cmd[:, 2], "t": s.t}
+
+
+def history(p, qpos, qvel, a_last, heading, done):
+    """The observation histories (..., H, 3 J + 12) that `step` held at the last of H consecutive steps of an env, rebuilt from
+    what a replay buffer keeps of every step (..., H, .): the simulator's qpos and qvel, the last raw action, the commanded
+    heading of the step's observation and whether the step ended its episode. Steps of an earlier episode are replaced by the
+    first step of the last step's episode, as `step` fills a new history."""
+    o = observation(p, qpos[..., 7:], qvel[..., 6:], quat_to_mat(qpos[..., 3:7]), qvel[..., 3:6], a_last[..., p["to_tracker"]], heading)
+    H = o.shape[-2]
+    first = jnp.max(jnp.arange(1, H) * (done[..., :-1] > 0), -1, initial=0)  # the window index where the last step's episode starts
+    return jnp.take_along_axis(o, jnp.maximum(jnp.arange(H), first[..., None])[..., None], -2)

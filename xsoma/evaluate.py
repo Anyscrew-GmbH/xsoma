@@ -11,9 +11,10 @@ masking, driven by the task's commands (tracker.py), all evaluated alike.
     python -m xsoma.evaluate <run dir or checkpoint> [...] [--n 2048] [--scale 0.5] [--sole_friction 0] [--preset fast_sac]
     python -m xsoma.evaluate <tracker checkpoint> --tracker_meta <the tracker's meta.json> [the same options]
 
-A run directory is evaluated checkpoint by checkpoint (XSoma: ckpt/*.npz; Holosoma: hs/**/model_*.npz), each with its wall-clock
-time since the run's launch, and the records are appended to <run>/eval.jsonl. The defaults are the setting that Holosoma's
-MuJoCo Warp baselines train in: terrain scale 0.5, sole friction fixed at 0.8. train.py calls this module after training.
+A run directory is evaluated checkpoint by checkpoint (XSoma: ckpt/*.npz, with --tracker_meta if the run fine-tuned a tracker;
+Holosoma: hs/**/model_*.npz), each with its wall-clock time since the run's launch, and the records are appended to
+<run>/eval.jsonl. The defaults are the setting that Holosoma's MuJoCo Warp baselines train in: terrain scale 0.5, sole friction
+fixed at 0.8. train.py calls this module after training.
 """
 
 import argparse
@@ -67,11 +68,11 @@ def evaluate(sim: Sim, act, key, steps: int = task.MAX_EPISODE + 2, mem=None):
 
 def load(path, which="avg", tracker_meta=None):
     """(kind, normalize, parameters) of an XSoma checkpoint, a converted Holosoma PPO / FastSAC actor or a tracker checkpoint
-    (with `tracker_meta`, the tracker's robot description)."""
+    (with `tracker_meta`, the tracker's robot description; `which` applies if train.py wrote the checkpoint)."""
     z = np.load(path)
     if "enc.0.w" in z.files:
         assert tracker_meta, f"{path} is a tracker checkpoint: give --tracker_meta"
-        return "tracker", False, tracker.load(path, tracker_meta)
+        return "tracker", False, tracker.load(path, tracker_meta, "live." if which == "live" and "live.enc.0.w" in z.files else "")
     if "kind" not in z.files:
         return "xsoma", False, load_policy(path, which)
     params = {k: jnp.asarray(z[k]) for k in z.files if k not in ("kind", "iteration", "normalize", "wall_s")}

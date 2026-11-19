@@ -2,7 +2,7 @@
 
 It keeps the latest steps of all envs in a ring. Collection adds one step at a time (`add`), world-model learning samples windows
 of consecutive steps of one env (`sample_windows`) and policy learning samples starting states for imagination
-(`sample_starts`).
+(`sample_starts`; `sample_histories` when the policy reads a history of steps).
 
 Leaves are the flattened transition record (see train.XSoma.record). The dynamics context xi is stored in float16; states,
 actions and the task context in float32 / int32. A transition j ends a world-model window when its env was done, or when the
@@ -103,6 +103,18 @@ def sample_starts(buf, key, B: int):
     s = gather(buf, _rows(buf, age), env)
     idx = jnp.argsort(1 - s["ok"], stable=True)[:B]
     return jax.tree.map(lambda x: x[idx], s)
+
+
+def sample_histories(buf, key, B: int, H: int):
+    """As `sample_starts`, each start with the H - 1 transitions of its env before it: (B, H, ...), the start last. The starts
+    are uniform over the finite transitions that have H - 1 older ones in the buffer."""
+    ka, ke = jax.random.split(key)
+    N = buf["s_qpos"].shape[1]
+    age = H - 1 + _uniform_int(ka, buf["size"] - (H - 1), 2 * B)
+    env = jax.random.randint(ke, (2 * B,), 0, N)
+    w = gather(buf, _rows(buf, age[:, None] + jnp.arange(1 - H, 1)), env[:, None])
+    idx = jnp.argsort(1 - w["ok"][:, -1], stable=True)[:B]
+    return jax.tree.map(lambda x: x[idx], w)
 
 
 def sanitize(rec_flat):

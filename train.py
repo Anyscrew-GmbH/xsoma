@@ -3,6 +3,7 @@
     python train.py --log_dir runs/xsoma            # 15 minutes of training (--minutes), then every checkpoint is evaluated
     python train.py --layout AL --log_dir runs/x4   # 2 or more GPUs: GPU 0 collects, the others update the policy (xsoma/multi_gpu.py)
     python train.py --robot_dir <dir> ...           # another robot: <dir>/robot.xml and <dir>/robot.json (README, Another robot)
+    python train.py --init_tracker <ckpt.npz> --tracker_meta <meta.json> ...   # fine-tune a motion tracker's policy (xsoma/tracker.py)
 
 Every option of xsoma/train.py's Config is a flag (--name value); the defaults are the published H100 configuration.
 Checkpoints, log.jsonl, config.json and eval.jsonl go to --log_dir.

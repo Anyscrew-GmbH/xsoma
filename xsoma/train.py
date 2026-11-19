@@ -14,6 +14,10 @@ The three parts are separate programs, compiled ahead of time and in parallel. E
 in place (donated buffers). The host only starts them and fetches statistics every `log_every` iterations. Checkpoints record
 the training time and the wall-clock time since launch.
 
+With `--init_tracker <checkpoint> --tracker_meta <meta.json>` the policy is a motion tracker's network (tracker.py), driven by
+the task's command and fine-tuned by the same updates; `--anchor` penalizes its distance from the initial tracker's actions and
+`--gait_clock 0` drops the reward term that follows the gait clock, which a tracker does not observe.
+
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
 """
@@ -33,7 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import buffer as rb
-from . import nets, optim, task
+from . import nets, optim, task, tracker
 from .sim import Sim, SimCfg, unflatten
 
 
@@ -81,6 +85,13 @@ class Config:
     #                         noisy, policies trained for about 45 minutes or more come to rely on the noise and fall without it
     cmd_fresh: float = 0.5  # share of imagined rollouts that start with a freshly drawn command
     term_tau: float = 0.02  # width (m) of the sigmoid that gives imagined terminations their gradient; their value stays exact
+    init_tracker: str = ""  # a tracker checkpoint (tracker.py): the policy is the tracker's network; its encoder and decoder are
+    #                         trained, its normalizers stay as loaded. "": XSoma's own policy. Layout 1GPU only
+    tracker_meta: str = ""  # with init_tracker: the meta.json of the tracker's robot, which must be the task's (tracker.load)
+    anchor: float = 0.0  # with init_tracker: weight of the mean squared distance between the imagined actions and the actions of
+    #                      the initial tracker on the same inputs (0: not computed)
+    gait_clock: int = 1  # 0: imagination's reward leaves out feet_phase, the term that follows the gait clock (a tracker does not
+    #                      observe the clock); the simulator's logged rewards and the evaluation keep the term
     # runtime
     imag_unroll: int = 4  # unrolling of the imagination loop (speed saturates at 4; compile time grows with it)
     imag_remat: str = "none"  # rematerialization of the imagination steps: none | dots | full (less memory, slower)
@@ -137,6 +148,12 @@ class XSoma:
         set_jax(c.jax_cache)
         self.sim = Sim(SimCfg(num_envs=c.num_envs, terrain=c.terrain, terrain_scale=c.terrain_scale, foot=c.foot, preset=c.preset,
                               sole_friction=bool(c.sole_friction), random_start=bool(c.random_start), seed=42 + c.seed))  # fmt: skip
+        self.reward_cfg = self.sim.reward_cfg if c.gait_clock else dataclasses.replace(self.sim.reward_cfg, feet_phase=0.0)  # imagination's reward
+        self.ckpt_extra = None  # a tracker policy: what save_ckpt writes besides the networks, the normalizers and the metadata as loaded
+        if c.init_tracker:
+            z = np.load(c.init_tracker)
+            # ponytail: the tracker's test vectors (test_oh, test_g, test_a) are left out, they would be stale; recompute test_a if a reader checks them
+            self.ckpt_extra = {k: z[k] for k in z.files if k.startswith(("obs_norm.", "goal_norm.", "meta"))}
         self.J = task.J
         self.n_soles = len(self.sim.sole_radius)  # the number of sole collider points
         J = self.J
@@ -153,7 +170,16 @@ class XSoma:
         rec_t = rb.flatten({**rec_t, "ok": jax.ShapeDtypeStruct((c.num_envs,), jnp.float32)})
         self.xi_dim = rec_t["xi"].shape[-1]
         self.wm_in = (13 + 2 * J) + self.n_soles + J + self.xi_dim  # invariant state, sole clearances, PD error, dynamics context
-        pi = nets.pi_init(ks[1], task.ACTOR_DIM, J)
+        pi, extra = nets.pi_init(ks[1], task.ACTOR_DIM, J), {}
+        if c.init_tracker:
+            tr = tracker.load(c.init_tracker, c.tracker_meta)
+            pi = {"enc": tr["enc"], "dec": tr["dec"]}
+            self.frozen = {k: v for k, v in tr.items() if k not in pi}  # constants of the programs, never trained
+            # mem: the tracker's memory in collection; pi0: the initial tracker, the anchor's reference
+            extra = {"mem": tracker.memory(tr, c.num_envs), **({"pi0": jax.tree.map(jnp.copy, pi)} if c.anchor > 0 else {})}
+            self.H = extra["mem"]["hist"].shape[1]
+            assert min(c.warmup_steps, c.buffer_steps) >= self.H, f"a start needs {self.H} collected steps for the tracker's history"
+            rec_t["heading"] = jax.ShapeDtypeStruct((c.num_envs,), jnp.float32)
         # wm: network weights, wm_b: its normalizers; 12 + 2 J outputs: the changes of position, rotation, v, w (3 each), q, qd
         wm, wm_b = nets.wm_init(ks[2], self.wm_in, 12 + 2 * J, widths(c.wm_hidden))
         # Muon masks (Muon where True, Adam elsewhere): none for the policy, the hidden weight matrices for the world model
@@ -165,7 +191,7 @@ class XSoma:
                  "pi": pi, "avg": jax.tree.map(jnp.copy, pi), "wm": wm, "wm_b": wm_b,
                  "opt_pi": optim.init(pi, self.pi_mask), "opt_wm": optim.init(wm, self.wm_mask),
                  "key": ks[3], "it": jnp.zeros((), jnp.int32), "env_steps": jnp.zeros((), jnp.float32), "nonfinite": jnp.zeros((), jnp.int32),
-                 "wm_ema": jnp.zeros((), jnp.float32), "gn_ema": jnp.zeros((), jnp.float32), "wm_ok": jnp.ones((), bool)}  # fmt: skip
+                 "wm_ema": jnp.zeros((), jnp.float32), "gn_ema": jnp.zeros((), jnp.float32), "wm_ok": jnp.ones((), bool), **extra}  # fmt: skip
         # make weakly typed scalars strongly typed, so that the carry has the same types going into and coming out of each program
         strong = lambda x: jnp.asarray(x, dtype=x.dtype) if isinstance(x, jax.Array) and x.weak_type else x  # noqa: E731
         return jax.tree.map(strong, carry)
@@ -195,9 +221,16 @@ class XSoma:
         c = self.cfg
         s = carry["env"]
         noisy = (jnp.arange(c.num_envs) * c.det_share) % 1.0 >= c.det_share  # every 1 / det_share-th env acts without noise
-        a = nets.pi_apply(carry["pi"], s.obs) + jnp.where(noisy, c.action_noise, 0.0)[:, None] * jax.random.normal(key, (c.num_envs, self.J))
+        if c.init_tracker:
+            a, mem = tracker.step({**self.frozen, **carry["pi"]}, carry["mem"], s)
+            carry = {**carry, "mem": mem}
+        else:
+            a = nets.pi_apply(carry["pi"], s.obs)
+        a = a + jnp.where(noisy, c.action_noise, 0.0)[:, None] * jax.random.normal(key, (c.num_envs, self.J))
         s1, tr = self.sim.step(s, a)
         rec, stats = self.record(s, s1, tr)
+        if c.init_tracker:  # the commanded heading of this step's observation (the memory holds the next step's)
+            rec["heading"] = mem["heading"] - task.DT * s.cmd[:, 2]
         flat = rb.sanitize(rb.flatten(rec))
         flat["ok"] = flat["ok"] * (1 - tr.diverged.astype(jnp.float32))  # a physics failure is not a valid transition
         stats = {**stats, "nonfinite_env": 1 - flat["ok"].mean()}
@@ -259,10 +292,16 @@ class XSoma:
     def sample_starts(self, buf, key):
         """Starting states for imagination: replayed states with their task context. A share (`cmd_fresh`) gets a freshly drawn
         command and gait frequency, with the gait phase recomputed, because in the real task a new command can arrive at any
-        state (every 500 steps and after a reset)."""
+        state (every 500 steps and after a reset). For a tracker policy a start also has `hist`, the observation history that
+        the tracker held there, rebuilt from the transitions before it."""
         c, B = self.cfg, self.cfg.pi_batch
         k_s, k_u, k_c = jax.random.split(key, 3)
-        start = rb.nest(rb.sample_starts(buf, k_s, B))
+        if c.init_tracker:
+            w = rb.sample_histories(buf, k_s, B, self.H)
+            start = rb.nest({k: v[:, -1] for k, v in w.items()})
+            start["hist"] = tracker.history(self.frozen, w["s_qpos"], w["s_qvel"], w["a_last"], w["heading"], w["done"])
+        else:
+            start = rb.nest(rb.sample_starts(buf, k_s, B))
         cmd, freq = task.sample_commands(k_c, B)
         fresh = jax.random.uniform(k_u, (B,)) < c.cmd_fresh
         start["cmd"] = jnp.where(fresh[:, None], cmd, start["cmd"])
@@ -279,21 +318,39 @@ class XSoma:
         hard = (cmin < 0).astype(jnp.float32)
         return hard + soft - jax.lax.stop_gradient(soft)
 
-    def imagine(self, pi, wm, wm_b, start, keys, scale, heights):
+    def imagine(self, pi, wm, wm_b, start, keys, scale, heights, pi0=None):
         """The loss of the policy update: the negative mean discounted return of `horizon` imagined steps from `start`. A step
         follows the task's order: the policy acts on the observation, the world model moves the robot, the reward and the
-        termination are read on the new state, then the gait phase advances and the command resamples every 500 steps."""
+        termination are read on the new state, then the gait phase advances and the command resamples every 500 steps. A tracker
+        policy (`pi`: its encoder and decoder) acts as in tracker.step, on its observation of the imagined state, the history
+        and the commanded heading; with `pi0`, the initial tracker, the loss gains `anchor` times the mean squared distance
+        between the two policies' actions on the same inputs, over the steps that count for the return."""
         c, B = self.cfg, self.cfg.pi_batch
         bf16 = c.mm_bf16 in ("imag", "all")
-        rcfg = self.sim.reward_cfg
+        rcfg = self.reward_cfg
         S0 = unflatten(start["s_qpos"], start["s_qvel"])
         xi, delay, offset = start["xi"], start["delay"], start["offset"]
+        if c.init_tracker:
+            pi = {**self.frozen, **pi}
 
         def step(carry, k):
-            S, v, a_last, cmd, freq, phase, t = carry
+            S, v, a_last, cmd, freq, phase, t, mem = carry
             k_o, k_c = jax.random.split(k)
-            obs, _ = task.observations(v.robot, a_last, cmd, phase, k_o)
-            a = nets.pi_apply(pi, obs, out_bf16=bf16)
+            pen = None
+            if c.init_tracker:
+                prev, heading = mem  # the H - 1 observations before this step's, the commanded heading
+                # ponytail: no observation noise on the tracker's inputs, here and in collect_step; add the tracker's own if the policy loses its tolerance of sensor noise
+                o = tracker.observation(pi, S[4], S[5], S[1], v.robot.w, a_last[:, pi["to_tracker"]], heading)
+                # ponytail: the goal is encoded at every step though the command changes every 500; encode per rollout and at resamples if imagination is too slow
+                hist, g = jnp.concatenate((prev, o[:, None]), 1), tracker.goal(pi, cmd)
+                a = tracker.act(pi, hist, g, out_bf16=bf16)[:, pi["to_sim"]]
+                mem = (hist[:, 1:], heading + task.DT * cmd[:, 2])
+                if pi0 is not None:  # the reference action is a constant: no gradient through its inputs either
+                    a0 = tracker.act({**pi, **pi0}, jax.lax.stop_gradient(hist), g, out_bf16=bf16)[:, pi["to_sim"]]
+                    pen = jnp.sum((a - a0) ** 2, -1)
+            else:
+                obs, _ = task.observations(v.robot, a_last, cmd, phase, k_o)
+                a = nets.pi_apply(pi, obs, out_bf16=bf16)
             # the PD target: an env with an action delay applies the previous action instead of this one
             tgt = jnp.clip(jnp.where(delay[:, None] == 0, a, a_last), -task.ACTION_CLIP, task.ACTION_CLIP)
             S1 = nets.wm_step(wm, wm_b, S, v.height, v.soles, target_q(tgt), xi, task.DT, out_bf16=bf16)
@@ -305,20 +362,25 @@ class XSoma:
             cmd2, freq2 = task.sample_commands(k_c, B)
             new = t1 % task.RESAMPLE == 0
             cmd1, freq1 = jnp.where(new[:, None], cmd2, cmd), jnp.where(new, freq2, freq)
-            return (S1, v1, a, cmd1, freq1, phase1, t1), (r, d)
+            return (S1, v1, a, cmd1, freq1, phase1, t1, mem), (r, d, pen)
 
         if c.imag_remat == "dots":
             step = jax.checkpoint(step, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         elif c.imag_remat == "full":
             step = jax.checkpoint(step)
-        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"])
-        _, (r, d) = jax.lax.scan(step, init, keys, unroll=c.imag_unroll)
+        mem = (start["hist"][:, :-1], start["heading"]) if c.init_tracker else None
+        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem)
+        _, (r, d, pen) = jax.lax.scan(step, init, keys, unroll=c.imag_unroll)
         alive = jnp.cumprod(1 - d, 0)
         alive_before = jnp.concatenate((jnp.ones_like(alive[:1]), alive[:-1]), 0)  # a step's reward counts if alive before it
         disc = c.gamma ** jnp.arange(c.horizon, dtype=jnp.float32)[:, None]
         G = (disc * alive_before * r).sum(0)
         # statistics: mean return, mean reward per step, and the share of rollouts still alive at the end of the horizon
-        return -G.mean(), {"G": G.mean(), "r": (alive_before * r).sum(0).mean() / c.horizon, "surv": alive[-1].mean()}
+        loss, stats = -G.mean(), {"G": G.mean(), "r": (alive_before * r).sum(0).mean() / c.horizon, "surv": alive[-1].mean()}
+        if pen is not None:
+            anchor = (alive_before * pen).mean()
+            loss, stats = loss + c.anchor * anchor, {**stats, "anchor": anchor}
+        return loss, stats
 
     def policy_update(self, carry, start, key):
         """One gradient step of the policy through imagination. The step is skipped when the gradient norm is not finite or
@@ -326,7 +388,7 @@ class XSoma:
         c = self.cfg
         env = carry["env"]
         (_, aux), grads = jax.value_and_grad(self.imagine, has_aux=True)(carry["pi"], carry["wm"], carry["wm_b"], start, jax.random.split(key, c.horizon),
-                                                                         env.scale, env.world.heights)  # fmt: skip
+                                                                         env.scale, env.world.heights, **({"pi0": carry["pi0"]} if "pi0" in carry else {}))  # fmt: skip
         grads, gn = optim.clip_by_global_norm(grads, c.pi_clip)  # gn is the norm before clipping
         finite = jnp.isfinite(gn)
         first = carry["gn_ema"] <= 0
@@ -375,7 +437,7 @@ class XSoma:
             return sub, jax.tree.map(jnp.mean, st)
 
         def skip(sub):
-            return sub, {k: jnp.zeros((), jnp.float32) for k in ("G", "r", "surv", "gn", "gn_gated")}
+            return sub, {k: jnp.zeros((), jnp.float32) for k in ("G", "r", "surv", "gn", "gn_gated") + (("anchor",) if "pi0" in carry else ())}
 
         active = carry["it"] >= c.wm_only_iters
         sub, pstats = jax.lax.cond(active & carry["wm_ok"], do, skip, {k: carry[k] for k in names})
@@ -395,11 +457,16 @@ class XSoma:
             return dict(zip(lowered, ex.map(lambda low: low.compile(), lowered.values())))
 
 
-def save_ckpt(path, pi_avg, pi_live, meta):
+def save_ckpt(path, pi_avg, pi_live, meta, extra=None):
     """Write the averaged and the live policy to <path>.npz, through a temporary file so that a reader never sees a partial one,
-    and the metadata (iteration, times, env steps) to <path>.json."""
-    flat = {}
+    and the metadata (iteration, times, env steps) to <path>.json. A tracker policy, given with `extra` (the normalizers and
+    the metadata of its initial checkpoint), is written as a tracker checkpoint (tracker.load): the averaged policy under the
+    tracker's own names, the live one under the prefix `live.`."""
+    flat = dict(extra or {})
     for name, layers in (("avg", pi_avg), ("live", pi_live)):
+        if extra:
+            flat |= {f"{'' if name == 'avg' else 'live.'}{net}.{i}.{k}": np.asarray(v) for net in layers for i, layer in enumerate(layers[net]) for k, v in layer.items()}
+            continue
         for i, layer in enumerate(layers):
             for k, v in layer.items():
                 flat[f"{name}/{i}/{k}"] = np.asarray(v)
@@ -423,6 +490,7 @@ def main(argv=None):
     cfg = parse(argv)
     # the robot is read when xsoma.task is imported: train.py passes the flag on in time, other entry points set the variable
     assert cfg.robot_dir == (task.ROBOT_DIR or ""), "--robot_dir needs train.py, or XSOMA_ROBOT_DIR set to the same directory"
+    assert bool(cfg.init_tracker) == bool(cfg.tracker_meta) and (cfg.init_tracker or not cfg.anchor), "--init_tracker and --tracker_meta go together, --anchor with them"
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]
     if flags:  # XLA reads XLA_FLAGS when its backend starts, so they are set before XSoma(cfg) first uses the GPU
         os.environ["XLA_FLAGS"] = " ".join([os.environ.get("XLA_FLAGS", "")] + flags).strip()
@@ -487,7 +555,7 @@ def main(argv=None):
         # a checkpoint every ckpt_minutes, and a last one when training ends
         if train_s - last_ckpt >= 60 * cfg.ckpt_minutes or train_s >= 60 * cfg.minutes:
             save_ckpt(os.path.join(cfg.log_dir, "ckpt", f"{n_ckpt:04d}"), carry["avg"], carry["pi"],
-                      {"it": it, "train_s": train_s, "wall_s": time.time() - t_launch, "env_steps": env_steps})  # fmt: skip
+                      {"it": it, "train_s": train_s, "wall_s": time.time() - t_launch, "env_steps": env_steps}, xs.ckpt_extra)  # fmt: skip
             last_ckpt, n_ckpt = train_s, n_ckpt + 1
         if train_s >= 60 * cfg.minutes:
             break
@@ -498,7 +566,7 @@ def main(argv=None):
         del carry, progs, xs  # free the training state before the evaluation builds its own simulator
         gc.collect()
         evaluate.main([cfg.log_dir, "--n", str(cfg.eval_n), "--scale", str(cfg.eval_scale), "--sole_friction", str(cfg.eval_sole_friction),
-                       "--preset", cfg.preset])  # fmt: skip
+                       "--preset", cfg.preset] + (["--tracker_meta", cfg.tracker_meta] if cfg.init_tracker else []))  # fmt: skip
 
 
 if __name__ == "__main__":
