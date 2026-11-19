@@ -5,9 +5,11 @@ envs start at step 0.
 Per policy it reports Holosoma's logged metrics (Episode/rew_<term> = the episode's sum of w dt r / 20 s, averaged over episodes;
 penalties at full weight, penalty scale 1), the mean episode length, the share of episodes that reach the time-out without a
 fall (`success`), and the mean velocity-tracking errors while the robot is alive. The policies are XSoma checkpoints
-(train.save_ckpt) and Holosoma's PPO and FastSAC actors (converted by tools/holosoma_ckpt.py), all evaluated alike.
+(train.save_ckpt), Holosoma's PPO and FastSAC actors (converted by tools/holosoma_ckpt.py) and tracker policies trained with goal
+masking, driven by the task's commands (tracker.py), all evaluated alike.
 
     python -m xsoma.evaluate <run dir or checkpoint> [...] [--n 2048] [--scale 0.5] [--sole_friction 0] [--preset fast_sac]
+    python -m xsoma.evaluate <tracker checkpoint> --tracker_meta <the tracker's meta.json> [the same options]
 
 A run directory is evaluated checkpoint by checkpoint (XSoma: ckpt/*.npz; Holosoma: hs/**/model_*.npz), each with its wall-clock
 time since the run's launch, and the records are appended to <run>/eval.jsonl. The defaults are the setting that Holosoma's
@@ -26,21 +28,23 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 
-from . import nets, task  # noqa: E402
+from . import nets, task, tracker  # noqa: E402
 from .sim import Sim, SimCfg  # noqa: E402
 
 
-def evaluate(sim: Sim, act, key, steps: int = task.MAX_EPISODE + 2):
-    """Run every env for one episode with the deterministic policy `act(obs) -> action`. The default number of steps lets every
-    env reach the time-out. Returns, per env, for its first episode only: the sums of the weighted reward terms, the length,
-    whether it ended in a fall, whether it ended at all, and the mean velocity and yaw-rate tracking errors while alive."""
+def evaluate(sim: Sim, act, key, steps: int = task.MAX_EPISODE + 2, mem=None):
+    """Run every env for one episode with the deterministic policy `act(obs) -> action`; with `mem` (a policy's initial memory)
+    it is `act(mem, state) -> (action, mem)`. The default number of steps lets every env reach the time-out. Returns, per env,
+    for its first episode only: the sums of the weighted reward terms, the length, whether it ended in a fall, whether it ended
+    at all, and the mean velocity and yaw-rate tracking errors while alive."""
     N = sim.N
     s = sim.init(key)
     s = s._replace(scale=jnp.ones_like(s.scale))  # penalties at full weight
 
     def body(carry, _):
-        s, sums, ended, length, fell, err_v, err_w, alive_steps = carry
-        s1, tr = sim.step(s, act(s.obs))
+        s, mem, sums, ended, length, fell, err_v, err_w, alive_steps = carry
+        a, mem = (act(s.obs), None) if mem is None else act(mem, s)
+        s1, tr = sim.step(s, a)
         live = ~ended  # the env's first episode is still running; what happens after its reset does not count
         sums = sums + jnp.where(live[:, None], tr.parts, 0.0)
         R = sim.view(tr.qpos1, tr.qvel1, s.world.heights).robot  # the robot after the physics, before any reset
@@ -52,18 +56,22 @@ def evaluate(sim: Sim, act, key, steps: int = task.MAX_EPISODE + 2):
         length = jnp.where(end, s.t + 1, length)
         fell = fell | (tr.terminated & live)
         # a step updates the penalty curriculum, so the scale is set back to 1
-        return (s1._replace(scale=jnp.ones_like(s1.scale)), sums, ended | end, length, fell, err_v, err_w, alive_steps), None
+        return (s1._replace(scale=jnp.ones_like(s1.scale)), mem, sums, ended | end, length, fell, err_v, err_w, alive_steps), None
 
     z = jnp.zeros((N,))
-    init = (s, jnp.zeros((N, len(task.TERMS))), jnp.zeros((N,), bool), z, jnp.zeros((N,), bool), z, z, z)
+    init = (s, mem, jnp.zeros((N, len(task.TERMS))), jnp.zeros((N,), bool), z, jnp.zeros((N,), bool), z, z, z)
     out, _ = jax.lax.scan(body, init, None, length=steps)
-    _, sums, ended, length, fell, err_v, err_w, alive_steps = out
+    _, _, sums, ended, length, fell, err_v, err_w, alive_steps = out
     return sums, length, fell, ended, err_v / jnp.maximum(alive_steps, 1), err_w / jnp.maximum(alive_steps, 1)
 
 
-def load(path, which="avg"):
-    """(kind, normalize, parameters) of an XSoma checkpoint or a converted Holosoma PPO / FastSAC actor."""
+def load(path, which="avg", tracker_meta=None):
+    """(kind, normalize, parameters) of an XSoma checkpoint, a converted Holosoma PPO / FastSAC actor or a tracker checkpoint
+    (with `tracker_meta`, the tracker's robot description)."""
     z = np.load(path)
+    if "enc.0.w" in z.files:
+        assert tracker_meta, f"{path} is a tracker checkpoint: give --tracker_meta"
+        return "tracker", False, tracker.load(path, tracker_meta)
     if "kind" not in z.files:
         return "xsoma", False, load_policy(path, which)
     params = {k: jnp.asarray(z[k]) for k in z.files if k not in ("kind", "iteration", "normalize", "wall_s")}
@@ -72,9 +80,11 @@ def load(path, which="avg"):
 
 def act_fn(kind, normalize=False):
     """(parameters, obs) -> deterministic action of a policy type (`kind` is "xsoma", "ppo" or "fast_sac"). The parameters are an
-    argument, so one compilation serves a policy type."""
+    argument, so one compilation serves a policy type. "tracker": (parameters, memory, state) -> (action, memory)."""
     if kind == "xsoma":
         return nets.pi_apply
+    if kind == "tracker":
+        return tracker.step
 
     def dot(p, h, i):
         return jnp.dot(h, p[f"w{i}"], precision=jax.lax.Precision.HIGHEST) + p[f"b{i}"]
@@ -130,16 +140,17 @@ def make_sim(n=2048, scale=0.5, sole_friction=False, preset="fast_sac", terrain=
     return Sim(SimCfg(num_envs=n, terrain=terrain, terrain_scale=scale, preset=preset, sole_friction=sole_friction, random_start=False))
 
 
-def run_all(sim: Sim, jobs, seed=1, which="avg", out=None):
+def run_all(sim: Sim, jobs, seed=1, which="avg", out=None, tracker_meta=None):
     """Evaluate (path, wall_s, steps, run) jobs; one compilation per policy type. Yields the result records; a job with a run
     directory appends its record to <run>/<out>.jsonl."""
     progs, key = {}, jax.random.PRNGKey(seed)
     for path, wall, steps, run in jobs:
-        kind, normalize, params = load(path, which)
+        kind, normalize, params = load(path, which, tracker_meta)
         if (kind, normalize) not in progs:
             act = act_fn(kind, normalize)
             # the parameters enter as arguments, so every checkpoint of a policy type reuses one compilation
-            progs[(kind, normalize)] = jax.jit(lambda p, k, act=act: evaluate(sim, jax.tree_util.Partial(act, p), k))
+            mem = (lambda p: tracker.memory(p, sim.N)) if kind == "tracker" else (lambda p: None)
+            progs[(kind, normalize)] = jax.jit(lambda p, k, act=act, mem=mem: evaluate(sim, jax.tree_util.Partial(act, p), k, mem=mem(p)))
         sums, length, fell, ended, ev, ew = jax.device_get(progs[(kind, normalize)](params, key))
         rew = sums.mean(0) / (task.MAX_EPISODE * task.DT)  # the episode sums per second, as Holosoma logs them
         rec = {"ckpt": path, "kind": kind, "wall_s": wall, "steps": steps, "n": sim.N, "scale": sim.cfg.terrain_scale, "sole_friction": sim.cfg.sole_friction,
@@ -162,6 +173,7 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--which", default="avg", help="XSoma checkpoints: avg (the averaged policy) or live")
     p.add_argument("--out", default="eval", help="records go to <run>/<out>.jsonl")
+    p.add_argument("--tracker_meta", default=None, help="tracker checkpoints: the meta.json of the tracker's robot (tracker.py)")
     a = p.parse_args(argv)
     sim = make_sim(a.n, a.scale, bool(a.sole_friction), a.preset, a.terrain)
     jobs = []
@@ -170,7 +182,7 @@ def main(argv=None):
             jobs += [(c, t, steps, path) for c, t, steps in checkpoints(path)]
         else:
             jobs.append((path, None, None, None))
-    for rec in run_all(sim, jobs, a.seed, a.which, a.out):
+    for rec in run_all(sim, jobs, a.seed, a.which, a.out, a.tracker_meta):
         t = f"{rec['wall_s'] / 60:.1f} min" if rec["wall_s"] is not None else ""
         print(f"[eval] {rec['ckpt']} {t}: length {rec['len']:.0f} no fall {rec['success']:.3f} velocity error {rec['err_v']:.3f} m/s "
               f"yaw-rate error {rec['err_w']:.3f} rad/s | Holosoma's tracking terms lin {rec['rew_tracking_lin_vel']:.3f} "

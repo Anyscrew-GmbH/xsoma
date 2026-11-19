@@ -280,7 +280,7 @@ bash tools/download_meshes.sh && python tools/rollout.py ckpt=$(ls runs/xsoma/ck
 train.py           entry point (every option: xsoma/train.py)
 xsoma/             task.py (Holosoma's task in JAX), sim.py (MuJoCo Warp simulator), scene.py, terrain.py, kin.py,
                    train.py (world model and imagination), multi_gpu.py (--layout AL), nets.py, buffer.py, optim.py, rot.py,
-                   evaluate.py
+                   evaluate.py, tracker.py (a motion tracker's policy driven by the task's commands)
 assets/            Holosoma's G1 MJCF (meshes: tools/download_meshes.sh)
 docs/              holosoma_task.md: Holosoma's task, line by line
 results/           per-run evaluation files behind every number and figure
