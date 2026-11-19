@@ -324,7 +324,7 @@ class XSoma:
         termination are read on the new state, then the gait phase advances and the command resamples every 500 steps. A tracker
         policy (`pi`: its encoder and decoder) acts as in tracker.step, on its observation of the imagined state, the history
         and the commanded heading; with `pi0`, the initial tracker, the loss gains `anchor` times the mean squared distance
-        between the two policies' actions on the same inputs, over the steps that count for the return."""
+        between the two policies' actions on the same inputs (held constant for it), over the steps that count for the return."""
         c, B = self.cfg, self.cfg.pi_batch
         bf16 = c.mm_bf16 in ("imag", "all")
         rcfg = self.reward_cfg
@@ -345,9 +345,12 @@ class XSoma:
                 hist, g = jnp.concatenate((prev, o[:, None]), 1), tracker.goal(pi, cmd)
                 a = tracker.act(pi, hist, g, out_bf16=bf16)[:, pi["to_sim"]]
                 mem = (hist[:, 1:], heading + task.DT * cmd[:, 2])
-                if pi0 is not None:  # the reference action is a constant: no gradient through its inputs either
-                    a0 = tracker.act({**pi, **pi0}, jax.lax.stop_gradient(hist), g, out_bf16=bf16)[:, pi["to_sim"]]
-                    pen = jnp.sum((a - a0) ** 2, -1)
+                if pi0 is not None:
+                    # both actions on the inputs as constants: through the rollout the penalty's gradient explodes (the
+                    # distance then grows with its weight); as a regression at fixed inputs it pulls the weights back
+                    fixed = jax.lax.stop_gradient(hist)
+                    a0 = tracker.act({**pi, **pi0}, fixed, g, out_bf16=bf16)
+                    pen = jnp.sum((tracker.act(pi, fixed, g, out_bf16=bf16) - a0) ** 2, -1)
             else:
                 obs, _ = task.observations(v.robot, a_last, cmd, phase, k_o)
                 a = nets.pi_apply(pi, obs, out_bf16=bf16)
