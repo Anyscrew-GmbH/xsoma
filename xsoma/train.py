@@ -19,7 +19,9 @@ the task's command and fine-tuned by the same updates; `--anchor` penalizes its 
 `--gait_clock 0` drops the reward term that follows the gait clock, which a tracker does not observe. `--tracker_noise` scales
 the noise on the tracker's observation (1: as in the tracker's own training) and `--tracker_heading rate` relates that
 observation to the base's own yaw instead of a held heading. `--feet_cross`, for any policy, weighs a penalty on the feet
-crossing sideways in imagination's reward.
+crossing sideways in imagination's reward. For a robot with `self_collision` groups (task.py), `--self_clearance` weighs a
+penalty on the two groups coming within 2 cm of each other, and `--self_clearance_term <m>` ends an imagined rollout once they
+overlap by more than that depth; both act in imagination only.
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -103,6 +105,11 @@ class Config:
     feet_cross: float = 0.0  # weight of the penalty task.feet_cross on the feet crossing sideways, in imagination's reward only,
     #                          times dt and the penalty curriculum's scale as Holosoma's penalties (0: not computed); the
     #                          evaluation reports the crossing whatever the weight
+    self_clearance: float = 0.0  # weight of the penalty task.self_clearance on the two `self_collision` groups (task.py) coming
+    #                              closer than task.SELF_CLEARANCE_MARGIN, pair by pair of their colliders (sim.SelfDistance), in
+    #                              imagination's reward only and weighted as feet_cross is (0: not computed)
+    self_clearance_term: float = 0.0  # > 0: an imagined rollout also ends, as in a fall, at a step in which a pair of those
+    #                                   colliders overlaps by more than this many meters (0: off); the simulator ends no episode
     # runtime
     imag_unroll: int = 4  # unrolling of the imagination loop (speed saturates at 4; compile time grows with it)
     imag_remat: str = "none"  # rematerialization of the imagination steps: none | dots | full (less memory, slower)
@@ -375,6 +382,12 @@ class XSoma:
             if c.feet_cross:  # weighted as task.weighted weighs a penalty
                 r = r - task.DT * c.feet_cross * scale * task.feet_cross(v1.robot)
             d = self.termination(v1.clearance)
+            if c.self_clearance or c.self_clearance_term:
+                gap = self.sim.self_distance(S1)
+                if c.self_clearance:  # weighted as task.weighted weighs a penalty
+                    r = r - task.DT * c.self_clearance * scale * task.self_clearance(gap)
+                if c.self_clearance_term:  # either event ends the rollout, each with its own sigmoid's gradient
+                    d = 1 - (1 - d) * (1 - self.termination(gap + c.self_clearance_term))
             t1 = t + 1
             phase1 = task.gait_phase(t1, freq, offset, cmd)
             cmd2, freq2 = task.sample_commands(k_c, B)
@@ -510,6 +523,8 @@ def main(argv=None):
     assert cfg.robot_dir == (task.ROBOT_DIR or ""), "--robot_dir needs train.py, or XSOMA_ROBOT_DIR set to the same directory"
     assert bool(cfg.init_tracker) == bool(cfg.tracker_meta) and (cfg.init_tracker or not cfg.anchor), "--init_tracker and --tracker_meta go together, --anchor with them"
     assert cfg.tracker_heading in ("hold", "rate") and cfg.feet_cross >= 0, "--tracker_heading is hold or rate, --feet_cross is not negative"
+    assert min(cfg.self_clearance, cfg.self_clearance_term) >= 0, "--self_clearance and --self_clearance_term are not negative"
+    assert task.SELF_COLLISION or cfg.self_clearance == cfg.self_clearance_term == 0, "--self_clearance and --self_clearance_term need robot.json's self_collision"
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]
     if flags:  # XLA reads XLA_FLAGS when its backend starts, so they are set before XSoma(cfg) first uses the GPU
         os.environ["XLA_FLAGS"] = " ".join([os.environ.get("XLA_FLAGS", "")] + flags).strip()

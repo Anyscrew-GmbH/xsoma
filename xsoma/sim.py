@@ -172,6 +172,59 @@ def _points(m: mujoco.MjModel, geoms, frames, bottom: bool):
     return np.asarray(local, np.float32), np.asarray(frame), np.asarray(radius, np.float32)
 
 
+def _segment_distance(a0, a1, b0, b1):
+    """Distance between the segments a0-a1 and b0-b1 (..., 3). The gradient holds the closest points constant: they minimize
+    the distance, so it is the exact one, and it stays finite for parallel segments."""
+    d1, d2, r = a1 - a0, b1 - b0, a0 - b0
+    dot = lambda x, y: jnp.sum(x * y, -1)  # noqa: E731
+    a, e, b, c, f = dot(d1, d1), dot(d2, d2), dot(d1, d2), dot(d1, r), dot(d2, r)
+    s = jnp.clip((b * f - c * e) / jnp.maximum(a * e - b * b, 1e-12), 0.0, 1.0)  # parallel: any point of a, improved below
+    t = jnp.clip((b * s + f) / e, 0.0, 1.0)
+    s = jnp.clip((b * t - c) / a, 0.0, 1.0)
+    s, t = jax.lax.stop_gradient((s[..., None], t[..., None]))
+    return jnp.sqrt(jnp.sum(jnp.square(r + s * d1 - t * d2), -1) + 1e-12)
+
+
+class SelfDistance:
+    """Signed distances (m) between every geom of `a` and every geom of `b` (the colliders of robot.json's `self_collision`
+    groups; pair k is `geoms[ia[k]]` with `geoms[ib[k]]`), negative when they overlap: a differentiable function of a state S. A
+    capsule is itself, a segment with a radius. A box is the capsule along its longest axis from face to face, with the
+    half-diagonal of the box's cross-section as radius: it contains the box, so the distance is never above the true one, and
+    is below it by at most `slack` per pair (per box: the radius at the capsule's end caps; across the box, the radius minus
+    the box's half-size in that direction)."""
+
+    def __init__(self, m: mujoco.MjModel, a, b):
+        self.geoms = geoms = [int(g) for g in (*a, *b)]
+        bodies = sorted({int(m.geom_bodyid[g]) for g in geoms})
+        self.kin = Kinematics(m, [m.body(i).name for i in bodies])
+        ends, radius, slack = [], [], []
+        for g in geoms:
+            R = np.asarray(quat_to_mat(np.asarray(m.geom_quat[g], np.float32)))
+            kind, size = int(m.geom_type[g]), m.geom_size[g]
+            if kind == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                axis, half, r = 2, size[1], size[0]
+            elif kind == mujoco.mjtGeom.mjGEOM_BOX:  # ponytail: one fat capsule; several thin ones if a flat box's faces matter
+                axis = int(np.argmax(size))
+                half, r = size[axis], float(np.linalg.norm(np.delete(size, axis)))
+            else:
+                raise ValueError(f"self_collision geom {m.geom(g).name} has unsupported type {kind}")
+            ends.append([m.geom_pos[g] + s * half * R[:, axis] for s in (1, -1)])
+            radius.append(r)
+            slack.append(r * (kind == mujoco.mjtGeom.mjGEOM_BOX))
+        self.frame = np.asarray([bodies.index(int(m.geom_bodyid[g])) for g in geoms])
+        self.ends = np.asarray(ends, np.float32)  # (n, 2, 3), in the body frames
+        self.ia, self.ib = (x.ravel() for x in np.meshgrid(np.arange(len(a)), len(a) + np.arange(len(b)), indexing="ij"))
+        self.radius = (np.asarray(radius)[self.ia] + np.asarray(radius)[self.ib]).astype(np.float32)
+        self.slack = np.asarray(slack)[self.ia] + np.asarray(slack)[self.ib]
+
+    def __call__(self, S):
+        p, R, _, _, q, _ = S
+        P, Rs = self.kin.forward(p, R, q)
+        e = P[..., self.frame, None, :] + mv3(Rs[..., self.frame, None, :, :], self.ends)
+        a, b = e[..., self.ia, :, :], e[..., self.ib, :, :]
+        return _segment_distance(a[..., 0, :], a[..., 1, :], b[..., 0, :], b[..., 1, :]) - self.radius
+
+
 class Sim:
     """N parallel envs of Holosoma's task: `init` resets all of them and `step` advances them by one policy step. `view` and
     `view_state` give the task's quantities (frames, terrain heights, clearances) of any state, also an imagined one."""
@@ -223,6 +276,8 @@ class Sim:
         self.kin = Kinematics(m, [m.body(b).name for b in frames])
         y = np.asarray(self.kin.forward(jnp.zeros(3), jnp.eye(3), jnp.asarray(task.DEFAULT_Q))[0])[2:4, 1]  # the feet in the default pose
         assert y[0] > y[1], "task.FEET must name the left foot first (task.feet_dy)"
+        if task.SELF_COLLISION is not None:  # the two groups' colliders are the geoms with scene.py's contact bit 4
+            self.self_distance = SelfDistance(m, np.flatnonzero(m.geom_contype & 4), np.flatnonzero(m.geom_conaffinity & 4))
         self.mass_ids = np.asarray([m.body(f"robot_{b}").id for b in task.MASS_BODIES])
         self.torso = m.body(f"robot_{task.TORSO}").id
 

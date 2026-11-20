@@ -249,7 +249,7 @@ def check_finetune(d, heading):
     assert [r["tracker_heading"] for r in recs] == want and len({r["feet_dy"] for r in recs}) == len(want) == out.getvalue().count("feet crossed")
     assert all(0 <= r["feet_crossed"] <= 1 and 0 < r["feet_dy"] < 0.5 for r in recs), recs
     print(f"evaluation: heading {heading} unless given, as the run's config.json " + ("says" if heading == "rate" else "is missing") + "; "
-          + out.getvalue().splitlines()[0].split(" | ")[-1])  # fmt: skip
+          + out.getvalue().splitlines()[0].split(" | ")[2])  # fmt: skip
 
 
 class Seq(NamedTuple):
@@ -278,11 +278,11 @@ class SeqSim:
     def view(self, step, qvel, heights):
         R = quat_to_mat(jnp.asarray(yaw_quat(self.YAW)))
         left = mv3(R, jnp.stack((jnp.full((3,), 0.3), jnp.asarray(self.DY)[jnp.arange(3), step], jnp.zeros((3,))), -1))
-        return SimpleNamespace(robot=task.Robot(None, R, jnp.zeros((3, 3)), jnp.zeros((3, 3)), None, None, None, jnp.stack((left, 0 * left), 1), None))
+        return SimpleNamespace(robot=task.Robot(None, R, jnp.zeros((3, 3)), jnp.zeros((3, 3)), None, None, None, jnp.stack((left, 0 * left), 1), None), soles=jnp.zeros((3, 1)))
 
 
 def check_eval():
-    *_, fell, _, _, _, crossed, dy = evaluate.evaluate(SeqSim(), lambda obs: obs, jax.random.PRNGKey(0), steps=6)
+    _, _, fell, _, _, _, crossed, dy, *_ = evaluate.evaluate(SeqSim(), lambda obs: obs, jax.random.PRNGKey(0), steps=6)
     assert np.asarray(fell).tolist() == [False, True, False]
     assert np.allclose(crossed, [2 / 6, 1 / 3, 0]) and np.allclose(dy, [SeqSim.DY[0].mean(), SeqSim.DY[1, :3].mean(), 0.25], atol=1e-6)
     print(f"evaluation: feet crossed in {[round(float(x), 3) for x in crossed]} of the steps before a fall or the end, mean distance {[round(float(x), 3) for x in dy]} m")

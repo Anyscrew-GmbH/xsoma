@@ -83,6 +83,7 @@ CONTACT_FORCE = 1.0  # N: a net contact force above this on a termination body e
 # robot.json's optional `self_collision` (the G1 has none): two groups of body names whose collision geoms collide, group with
 # group (scene.py); these contacts are simulated but do not count for the termination (sim.py)
 SELF_COLLISION = _ROBOT.get("self_collision") if ROBOT_DIR else None
+SELF_CLEARANCE_MARGIN = 0.02  # m: self_clearance penalizes every pair of the two groups' colliders that is closer than this
 
 
 class Robot(NamedTuple):
@@ -222,6 +223,12 @@ def feet_dy(robot: Robot):
 def feet_cross(robot: Robot):
     """The feet-crossing penalty term, which is not Holosoma's (train.py --feet_cross): max(0, FEET_CROSS_MARGIN - feet_dy)."""
     return jnp.maximum(0.0, FEET_CROSS_MARGIN - feet_dy(robot))
+
+
+def self_clearance(distance):
+    """The self-clearance penalty term, which is not Holosoma's (train.py --self_clearance): over the pairs of `self_collision`
+    colliders, with their signed distances (sim.SelfDistance), the sum of max(0, SELF_CLEARANCE_MARGIN - distance)."""
+    return jnp.maximum(0.0, SELF_CLEARANCE_MARGIN - distance).sum(-1)
 
 
 def reward_terms(robot: Robot, foot_heights, a, a_prev, cmd, phase):

@@ -6,8 +6,13 @@ Per policy it reports Holosoma's logged metrics (Episode/rew_<term> = the episod
 penalties at full weight, penalty scale 1), the mean episode length, the share of episodes that reach the time-out without a
 fall (`success`), the mean velocity-tracking errors while the robot is alive, and of the feet (task.feet_dy: how far the left one
 is to the left of the right one) the share of an episode's alive steps in which they are crossed and the mean distance, both
-averaged over episodes. The policies are XSoma checkpoints
-(train.save_ckpt), Holosoma's PPO and FastSAC actors (converted by tools/holosoma_ckpt.py) and tracker policies trained with goal
+averaged over episodes. Of the soles it reports how far their deepest collider point is under the terrain surface
+(sim.View.soles), in meters: each episode's largest depth, averaged over episodes (`sole_sink_max`), the share of alive steps
+in which it exceeds SOLE_SINK (`sole_sink_frac`) and the depth that 99 % of all alive steps stay within (`sole_sink_p99`). For
+a robot with `self_collision` groups (task.py) it adds, from the signed distances between the two groups' colliders
+(sim.SelfDistance), the share of alive steps in which any pair overlaps (`legs_overlap`) and the mean smallest distance
+(`legs_dist`). The policies are XSoma checkpoints (train.save_ckpt), Holosoma's PPO and FastSAC actors (converted by
+tools/holosoma_ckpt.py) and tracker policies trained with goal
 masking, driven by the task's commands (tracker.py), all evaluated alike.
 
     python -m xsoma.evaluate <run dir or checkpoint> [...] [--n 2048] [--scale 0.5] [--sole_friction 0] [--preset fast_sac]
@@ -32,43 +37,55 @@ import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 
 from . import nets, task, tracker  # noqa: E402
-from .sim import Sim, SimCfg  # noqa: E402
+from .sim import Sim, SimCfg, unflatten  # noqa: E402
+
+SOLE_SINK = 0.01  # m: sole_sink_frac counts the steps in which a sole collider point is further than this below the terrain
 
 
 def evaluate(sim: Sim, act, key, steps: int = task.MAX_EPISODE + 2, mem=None):
     """Run every env for one episode with the deterministic policy `act(obs) -> action`; with `mem` (a policy's initial memory)
     it is `act(mem, state) -> (action, mem)`. The default number of steps lets every env reach the time-out. Returns, per env,
     for its first episode only: the sums of the weighted reward terms, the length, whether it ended in a fall, whether it ended
-    at all, and while alive the mean velocity and yaw-rate tracking errors, the share of steps with the feet crossed and the mean
-    of task.feet_dy."""
+    at all, and while alive the mean velocity and yaw-rate tracking errors, the share of steps with the feet crossed, the mean
+    of task.feet_dy and the share of steps with a sole point more than SOLE_SINK below the terrain; then the largest depth of a
+    sole point below the terrain and, as one number for all envs, the 99th percentile of that depth over the alive steps; with
+    task.SELF_COLLISION also the share of alive steps in which the two groups overlap and the mean of their smallest distance
+    (sim.SelfDistance)."""
     N = sim.N
     s = sim.init(key)
     s = s._replace(scale=jnp.ones_like(s.scale))  # penalties at full weight
 
     def body(carry, _):
-        s, mem, sums, ended, length, fell, err_v, err_w, crossed, dy, alive_steps = carry
+        s, mem, sums, ended, length, fell, sink, err_v, err_w, crossed, dy, deep, legs, alive_steps = carry
         a, mem = (act(s.obs), None) if mem is None else act(mem, s)
         s1, tr = sim.step(s, a)
         live = ~ended  # the env's first episode is still running; what happens after its reset does not count
         sums = sums + jnp.where(live[:, None], tr.parts, 0.0)
-        R = sim.view(tr.qpos1, tr.qvel1, s.world.heights).robot  # the robot after the physics, before any reset
+        v = sim.view(tr.qpos1, tr.qvel1, s.world.heights)  # the task's view after the physics, before any reset
+        R = v.robot
         v_b = jnp.einsum("nji,nj->ni", R.R, R.v)
         err_v = err_v + jnp.where(live, jnp.linalg.norm(s.cmd[:, :2] - v_b[:, :2], axis=-1), 0.0)
         err_w = err_w + jnp.where(live, jnp.abs(s.cmd[:, 2] - R.w[:, 2]), 0.0)
         d = task.feet_dy(R)
         crossed, dy = crossed + (live & (d < 0)), dy + jnp.where(live, d, 0.0)
+        depth = jnp.maximum(-v.soles.min(-1), 0.0)  # of the deepest sole point under the terrain
+        sink, deep = jnp.maximum(sink, jnp.where(live, depth, 0.0)), deep + (live & (depth > SOLE_SINK))
+        if legs:
+            gap = sim.self_distance(unflatten(tr.qpos1, tr.qvel1)).min(-1)
+            legs = (legs[0] + (live & (gap < 0)), legs[1] + jnp.where(live, gap, 0.0))
         alive_steps = alive_steps + live
         end = (tr.terminated | tr.truncated) & live
         length = jnp.where(end, s.t + 1, length)
         fell = fell | (tr.terminated & live)
         # a step updates the penalty curriculum, so the scale is set back to 1
-        return (s1._replace(scale=jnp.ones_like(s1.scale)), mem, sums, ended | end, length, fell, err_v, err_w, crossed, dy, alive_steps), None
+        return (s1._replace(scale=jnp.ones_like(s1.scale)), mem, sums, ended | end, length, fell, sink, err_v, err_w, crossed, dy, deep, legs, alive_steps), jnp.where(live, depth, jnp.nan)
 
     z = jnp.zeros((N,))
-    init = (s, mem, jnp.zeros((N, len(task.TERMS))), jnp.zeros((N,), bool), z, jnp.zeros((N,), bool), z, z, z, z, z)
-    out, _ = jax.lax.scan(body, init, None, length=steps)
-    _, _, sums, ended, length, fell, *means, alive_steps = out
-    return (sums, length, fell, ended) + tuple(x / jnp.maximum(alive_steps, 1) for x in means)
+    init = (s, mem, jnp.zeros((N, len(task.TERMS))), jnp.zeros((N,), bool), z, jnp.zeros((N,), bool), z, z, z, z, z, z, (z, z) if task.SELF_COLLISION else (), z)
+    out, depth = jax.lax.scan(body, init, None, length=steps)
+    _, _, sums, ended, length, fell, sink, *means, legs, alive_steps = out
+    means, legs = (tuple(x / jnp.maximum(alive_steps, 1) for x in xs) for xs in (means, legs))
+    return (sums, length, fell, ended, *means, sink, jnp.nanpercentile(depth, 99.0), *legs)
 
 
 def load(path, which="avg", tracker_meta=None):
@@ -163,11 +180,13 @@ def run_all(sim: Sim, jobs, seed=1, which="avg", out=None, tracker_meta=None, tr
             # the parameters enter as arguments, so every checkpoint of a policy type reuses one compilation
             mem = (lambda p: tracker.memory(p, sim.N)) if kind == "tracker" else (lambda p: None)
             progs[(kind, normalize, heading)] = jax.jit(lambda p, k, act=act, mem=mem: evaluate(sim, jax.tree_util.Partial(act, p), k, mem=mem(p)))
-        sums, length, fell, ended, ev, ew, crossed, dy = jax.device_get(progs[(kind, normalize, heading)](params, key))
+        sums, length, fell, ended, ev, ew, crossed, dy, deep, sink, p99, *legs = jax.device_get(progs[(kind, normalize, heading)](params, key))
         rew = sums.mean(0) / (task.MAX_EPISODE * task.DT)  # the episode sums per second, as Holosoma logs them
         rec = {"ckpt": path, "kind": kind, "wall_s": wall, "steps": steps, "n": sim.N, "scale": sim.cfg.terrain_scale, "sole_friction": sim.cfg.sole_friction,
                "len": float(length.mean()), "success": float(1 - fell.mean()), "ended": float(ended.mean()), "err_v": float(ev.mean()),
                "err_w": float(ew.mean()), "feet_crossed": float(crossed.mean()), "feet_dy": float(dy.mean()),
+               "sole_sink_max": float(sink.mean()), "sole_sink_frac": float(deep.mean()), "sole_sink_p99": float(p99),
+               **({"legs_overlap": float(legs[0].mean()), "legs_dist": float(legs[1].mean())} if legs else {}),
                **({"tracker_heading": heading} if heading else {}), **{f"rew_{k}": float(v) for k, v in zip(task.TERMS, rew)}}  # fmt: skip
         if run and out:
             with open(os.path.join(run, out + ".jsonl"), "a") as f:
@@ -201,7 +220,10 @@ def main(argv=None):
         t = f"{rec['wall_s'] / 60:.1f} min" if rec["wall_s"] is not None else ""
         print(f"[eval] {rec['ckpt']} {t}: length {rec['len']:.0f} no fall {rec['success']:.3f} velocity error {rec['err_v']:.3f} m/s "
               f"yaw-rate error {rec['err_w']:.3f} rad/s | Holosoma's tracking terms lin {rec['rew_tracking_lin_vel']:.3f} "
-              f"ang {rec['rew_tracking_ang_vel']:.3f} | feet crossed {rec['feet_crossed']:.3f} of the steps, mean distance {rec['feet_dy']:.3f} m", flush=True)  # fmt: skip
+              f"ang {rec['rew_tracking_ang_vel']:.3f} | feet crossed {rec['feet_crossed']:.3f} of the steps, mean distance {rec['feet_dy']:.3f} m | "
+              f"soles under the terrain: an episode's deepest {1000 * rec['sole_sink_max']:.1f} mm, 99 % of the steps within {1000 * rec['sole_sink_p99']:.1f} mm, "
+              f"deeper than {1000 * SOLE_SINK:.0f} mm in {rec['sole_sink_frac']:.4f} of the steps"
+              + (f" | legs overlap {rec['legs_overlap']:.3f} of the steps, mean smallest distance {rec['legs_dist']:.3f} m" if "legs_overlap" in rec else ""), flush=True)  # fmt: skip
 
 
 if __name__ == "__main__":
