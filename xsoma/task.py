@@ -80,6 +80,9 @@ TERMINATION_BODIES = _robot("termination_bodies", ("pelvis", "left_hip_pitch_lin
                       "right_hip_roll_link", "right_hip_yaw_link", "left_shoulder_pitch_link", "left_shoulder_roll_link",
                       "left_shoulder_yaw_link", "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link"))  # fmt: skip
 CONTACT_FORCE = 1.0  # N: a net contact force above this on a termination body ends the episode (spec 7)
+# robot.json's optional `self_collision` (the G1 has none): two groups of body names whose collision geoms collide, group with
+# group (scene.py); these contacts are simulated but do not count for the termination (sim.py)
+SELF_COLLISION = _ROBOT.get("self_collision") if ROBOT_DIR else None
 
 
 class Robot(NamedTuple):
@@ -301,6 +304,24 @@ GAIN_SCALE = (0.9, 1.1)  # kp and kd per (env, joint), every reset
 MAX_DELAY = 1  # action delay in policy steps, U{0, 1} per env at every reset
 PUSH_INTERVAL = (5.0, 10.0)  # s between pushes, per env; a push overwrites the root's world (vx, vy) with U[-1, 1] each
 PUSH_VEL = 1.0
+
+
+def _payload(entries):
+    """robot.json's optional `payload` (the G1 has none) -> the bodies' names and, per body, the ranges (lo, hi) of its mass (kg)
+    and CoM (m, body frame) as (n, 4) arrays. The second body of an entry is the first one's mirror image: its y range is mirrored."""
+    names, lo, hi = [], [], []
+    for e in entries:
+        a, b = [e["mass"][0], *e["com_lo"]], [e["mass"][1], *e["com_hi"]]
+        assert len(e["bodies"]) in (1, 2) and len(a) == len(b) == 4, f"payload {e}: one body or a mirror pair, CoM as [x, y, z]"
+        assert 0 < a[0] and all(x <= y for x, y in zip(a, b)), f"payload {e['bodies']}: ranges must be lo <= hi, mass > 0"
+        names += e["bodies"]
+        lo += [a, [a[0], a[1], -b[2], a[3]]][: len(e["bodies"])]
+        hi += [b, [b[0], b[1], -a[2], b[3]]][: len(e["bodies"])]
+    return tuple(names), np.asarray(lo, np.float32).reshape(-1, 4), np.asarray(hi, np.float32).reshape(-1, 4)
+
+
+# welded bodies of the MJCF (no joint, no collider) whose mass and CoM are drawn per env, inertia by the mass ratio (setup only)
+PAYLOAD_BODIES, PAYLOAD_LO, PAYLOAD_HI = _payload(_ROBOT.get("payload", []) if ROBOT_DIR else [])
 
 # ------------------------------------------------------------------ resets (spec 8)
 SPAWN_HEIGHT = _robot("spawn_height", 0.8)  # pelvis height above the tile origin (the terrain at the spawn point is not looked up)

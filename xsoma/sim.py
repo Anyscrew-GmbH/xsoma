@@ -190,7 +190,17 @@ class Sim:
         else:
             raise ValueError(f"terrain must be 'mix' or 'plane', not {c.terrain!r}")
         self.m = m = scene.build(c.foot, self.terrain, tiles=c.tiles, iterations=c.iterations, ls_iterations=c.ls_iterations,
-                                 ccd_tolerance=c.ccd_tolerance)  # fmt: skip
+                                 ccd_tolerance=c.ccd_tolerance, self_collision=task.SELF_COLLISION)  # fmt: skip
+        # robot.json's payload bodies, checked first: a jointed one would fail the joint-order check below less clearly
+        names = [m.body(i).name for i in range(m.nbody)]
+        for b in task.PAYLOAD_BODIES:
+            assert f"robot_{b}" in names, f"payload body {b!r} is not a body of robot.xml"
+            i = names.index(f"robot_{b}")
+            assert m.body_jntnum[i] == 0, f"payload body {b!r} has a joint: it must be welded to its parent"
+            assert m.body_mass[i] > 0, f"payload body {b!r} needs a nominal mass (its inertia is scaled by mass / nominal mass)"
+            assert not ((m.geom_bodyid == i) & ((m.geom_contype | m.geom_conaffinity) > 0)).any(), f"payload body {b!r} has a collider"
+            assert b not in task.MASS_BODIES + (task.TORSO,), f"payload body {b!r} is randomized already (mass_bodies / torso)"
+        self.payload = np.asarray([names.index(f"robot_{b}") for b in task.PAYLOAD_BODIES], int)
         joints = tuple(m.joint(j).name.removeprefix("robot_").removesuffix("_joint") for j in range(1, m.njnt))
         assert joints == task.DOF, f"joint order {joints} != task.DOF"
         assert [int(m.actuator_trnid[i, 0]) for i in range(m.nu)] == list(range(1, m.njnt)), "one motor per joint, in joint order"
@@ -250,7 +260,8 @@ class Sim:
     def world(self, key) -> World:
         """Start-up randomization (spec 9): link masses x U[0.9, 1.2] (inertia by the same ratio), torso mass + U[-1, 3] kg
         (inertia by the ratio) and CoM + U[-0.05, 0.05] m per axis, friction from 64 quantiles of U[0.5, 1.25] per env for
-        every geom (robot and terrain; the soles only with sole_friction)."""
+        every geom (robot and terrain; the soles only with sole_friction); robot.json's payload bodies: mass and CoM uniform in
+        their ranges, inertia by the mass ratio."""
         m, N, c = self.m, self.N, self.cfg
         k_link, k_add, k_com, k_mu = jax.random.split(key, 4)
         tile = lambda x: jnp.tile(jnp.asarray(x, jnp.float32)[None], (N,) + (1,) * np.ndim(x))  # noqa: E731
@@ -262,6 +273,10 @@ class Sim:
         ratio = (m.body_mass[torso] + add) / m.body_mass[torso]
         mass, inertia = mass.at[:, torso].add(add), inertia.at[:, torso].multiply(ratio[:, None])
         ipos = ipos.at[:, torso].add(jax.random.uniform(k_com, (N, 3), minval=-task.TORSO_COM, maxval=task.TORSO_COM))
+        if len(p := self.payload):  # a key of its own, so that the draws above stay those of a robot without payload
+            u = jax.random.uniform(jax.random.fold_in(key, 1), (N, len(p), 4), minval=task.PAYLOAD_LO, maxval=task.PAYLOAD_HI)
+            inertia = inertia.at[:, p].multiply(u[..., :1] / m.body_mass[p][:, None])
+            mass, ipos = mass.at[:, p].set(u[..., 0]), ipos.at[:, p].set(u[..., 1:])
         lo, hi = task.FRICTION
         mu = lo + (hi - lo) * (jax.random.randint(k_mu, (N,), 0, task.FRICTION_BUCKETS) + 0.5) / task.FRICTION_BUCKETS
         friction = tile(m.geom_friction)
@@ -275,10 +290,15 @@ class Sim:
 
     def context(self, s: State):
         """(N, 72) dynamics context xi of each env: its PD gain scales, link mass scales, torso added mass and CoM offset,
-        friction. These differ between envs but cannot be read off a state, so the world model gets them as an extra input."""
-        m, w, t = self.m, s.world, self.torso
-        return jnp.concatenate((s.kp, s.kd, w.body_mass[:, self.mass_ids] / m.body_mass[self.mass_ids], (w.body_mass[:, t] - m.body_mass[t])[:, None],
-                                w.body_ipos[:, t] - m.body_ipos[t], w.geom_friction[:, 0, :1]), -1)  # fmt: skip
+        friction, then per payload body (robot.json) its added mass and CoM offset (4 more each). These differ between envs but
+        cannot be read off a state, so the world model gets them as an extra input."""
+        m, w, t, p = self.m, s.world, self.torso, self.payload
+        xi = jnp.concatenate((s.kp, s.kd, w.body_mass[:, self.mass_ids] / m.body_mass[self.mass_ids], (w.body_mass[:, t] - m.body_mass[t])[:, None],
+                              w.body_ipos[:, t] - m.body_ipos[t], w.geom_friction[:, 0, :1]), -1)  # fmt: skip
+        if not len(p):
+            return xi
+        pay = jnp.concatenate(((w.body_mass[:, p] - m.body_mass[p])[..., None], w.body_ipos[:, p] - m.body_ipos[p]), -1)
+        return jnp.concatenate((xi, pay.reshape(len(pay), -1)), -1)
 
     def init(self, key) -> State:
         """Reset every env, then take one zero-action step, as Holosoma does at start-up (the curriculum updates in both)."""
@@ -320,7 +340,8 @@ class Sim:
     def collider_forces(self, data):
         """(N, n, 3) world-frame net contact force on each termination collider (one per body) after the last substep, rebuilt
         from the solver's constraint forces: every contact of the (global) contact pool is decoded from its 4 pyramid rows into
-        a force in its contact frame, turned into the world frame, and summed per (world, collider)."""
+        a force in its contact frame, turned into the world frame, and summed per (world, collider). With robot.json's
+        `self_collision`, only the contacts with a terrain geom (a geom of the world body) are summed."""
         im, N = data._impl, self.N
         n_slots = int(self.term_slot.max()) + 1
         valid = jnp.arange(im.contact__dist.shape[0]) < im.nacon[0]
@@ -332,6 +353,8 @@ class Sim:
         slot_of = jnp.asarray(self.term_slot)
         slot = jnp.maximum(slot_of[im.contact__geom[:, 0]], slot_of[im.contact__geom[:, 1]])
         hit = valid & (slot >= 0)
+        if task.SELF_COLLISION is not None:  # a contact between two robot geoms is not a fall: only terrain contacts count
+            hit &= jnp.asarray(self.m.geom_bodyid == 0)[im.contact__geom].any(-1)
         idx = jnp.clip(w, 0, N - 1) * n_slots + jnp.maximum(slot, 0)
         acc = jnp.zeros((N * n_slots, 3)).at[idx].add(jnp.where(hit[:, None], F, 0.0))
         return acc.reshape(N, n_slots, 3)

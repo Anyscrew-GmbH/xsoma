@@ -28,6 +28,9 @@ Options of `build` and `spec`:
   visual    False drops the visual meshes (never collide; MuJoCo would still place them every step)
   sensors   False drops the MJCF's IMU and lidar-frame sensors: the task reads qpos / qvel, and the accelerometer would cost
             a post-constraint pass (cacc, cfrc_int, cfrc_ext) every substep
+  self_collision   robot.json's optional `self_collision` (task.py): two groups of body names (A, B). Every collision geom of an
+            A body collides with every collision geom of a B body, through contact bit 4 on A's contype and on B's
+            conaffinity: no other pair of geoms shares a bit that it did not share before
 """
 
 from __future__ import annotations
@@ -88,13 +91,15 @@ def _terrain_geoms(world, terrain: terrain_mod.Terrain, tiles: bool):
 
 
 def build(foot: str = "capsules", terrain: terrain_mod.Terrain | None = None, tiles: bool = True, pairs: bool = False, visual: bool = False,
-          sensors: bool = False, iterations: int = 100, ls_iterations: int = 50, ccd_tolerance: float = 1e-6, xml: str = G1_XML) -> mujoco.MjModel:  # fmt: skip
+          sensors: bool = False, iterations: int = 100, ls_iterations: int = 50, ccd_tolerance: float = 1e-6, xml: str = G1_XML,
+          self_collision=None) -> mujoco.MjModel:  # fmt: skip
     """Compile the scene of `spec`, which takes the same options."""
-    return spec(foot, terrain, tiles, pairs, visual, sensors, iterations, ls_iterations, ccd_tolerance, xml).compile()
+    return spec(foot, terrain, tiles, pairs, visual, sensors, iterations, ls_iterations, ccd_tolerance, xml, self_collision).compile()
 
 
 def spec(foot: str = "capsules", terrain: terrain_mod.Terrain | None = None, tiles: bool = True, pairs: bool = False, visual: bool = False,
-         sensors: bool = False, iterations: int = 100, ls_iterations: int = 50, ccd_tolerance: float = 1e-6, xml: str = G1_XML) -> mujoco.MjSpec:  # fmt: skip
+         sensors: bool = False, iterations: int = 100, ls_iterations: int = 50, ccd_tolerance: float = 1e-6, xml: str = G1_XML,
+         self_collision=None) -> mujoco.MjSpec:  # fmt: skip
     """The scene before compilation (with build's options), for example to restyle it for rendering."""
     world = mujoco.MjSpec()
     world.copy_during_attach = True
@@ -146,6 +151,17 @@ def spec(foot: str = "capsules", terrain: terrain_mod.Terrain | None = None, til
     for g in robot.geoms:
         if g.contype == 1 and g.conaffinity == 1:
             g.conaffinity = 2
+    if self_collision is not None:
+        assert len(self_collision) == 2 and all(self_collision), f"self_collision {self_collision}: two non-empty groups of body names"
+        both = sorted(set(self_collision[0]) & set(self_collision[1]))
+        assert not both, f"self_collision: {both} are in both groups"
+        for group, bits in zip(self_collision, ("contype", "conaffinity")):
+            for name in group:
+                assert robot.body(name) is not None, f"self_collision body {name!r} is not a body of the robot's MJCF"
+                geoms = [g for g in robot.body(name).geoms if g.contype == 1 and g.conaffinity == 2]
+                assert geoms, f"self_collision body {name!r} has no collision geom"
+                for g in geoms:
+                    setattr(g, bits, getattr(g, bits) | 4)
     world.attach(robot, frame=world.worldbody.add_frame(), prefix="robot_")
     return world
 

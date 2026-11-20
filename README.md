@@ -228,6 +228,13 @@ A robot other than the G1 is a directory with two files, given as `python train.
   wrapped in `_robot`): `dof` (the joint names without `_joint`, in the MJCF's order), `default_q`, `kp`, `kd`, `effort` and
   `pose_w` (one number per joint), `action_scale` (one number, or one per joint), `foot_points` and `feet` (the left foot's
   body first), `termination_bodies` and `mass_bodies` (body names), `torso` (the body with the added mass) and `spawn_height`.
+  Optional, `payload`: `[{"bodies": [name] or [name, its mirror image], "mass": [lo, hi], "com_lo": [x, y, z], "com_hi": [x, y, z]}]`,
+  bodies welded to their parent (no joint, no collider) with a nominal mass in the MJCF. Per env, once at start-up like the
+  torso's, each body's mass (kg) and CoM (its own frame; y range mirrored for the second body) are drawn uniformly, its inertia
+  scaled by mass / nominal mass; the context xi gets 4 more values per body (added mass, CoM offset).
+  Optional, `self_collision`: `[[body names of group A], [body names of group B]]` (one pair of groups, for example the two
+  legs): every collider of an A body collides with every collider of a B body, none within a group, and the rest of the robot
+  still with the terrain only. The simulator applies these contacts, but only terrain contacts end an episode.
 
 The PD law is explicit at the 5 ms physics step, so every joint needs 2 kd h / I + kp h² / I < 4 (h the step, I the joint's
 inertia, at least its armature); a joint beyond that chatters between its torque limits. `--foot box` is the G1's box foot.
