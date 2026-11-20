@@ -6,6 +6,8 @@ order, and a tracker checkpoint with random weights.
                set, another default pose or action scale are refused
   goal         K frames of the neutral values with the command at v x, v y, w z, then the flag
   observation  every block where the tracker expects it; gravity and the relative rotation for an upright robot
+  noise        none without a key or at scale 0; at scale 1 every block moves within its training scale (tracker.NOISE)
+  heading      without a commanded heading ("rate") the relative rotation is the base's tilt alone, whatever its yaw
   step         the heading starts at the base's yaw and integrates the commanded yaw rate; the history fills at an episode's
                first step and then shifts; a reset starts both anew; the action comes back in the simulator's joint order
 """
@@ -93,6 +95,21 @@ def test_tracker():
     assert np.allclose(tracker.observation(p, q[0], qd[0], pitch, w[0], a_prev[0], np.float32(0))[2 * J + 3 : 2 * J + 6], [np.sin(0.3), 0, -np.cos(0.3)], atol=1e-6)
     print("observation: q - q0, qd, angular velocity, gravity, previous action and relative rotation where the tracker expects them")
 
+    key = jax.random.PRNGKey(2)
+    dev = [np.asarray(tracker.observation(p, q, qd, R, w, a_prev, yaw, key, n)) - o for n in (0.0, 1.0, 2.0)]
+    scale = np.repeat(np.asarray(tracker.NOISE, np.float32), (J, J, 3, 3, J, 6))  # per entry
+    assert (dev[0] == 0).all() and np.allclose(dev[2], 2 * dev[1], atol=1e-6) and np.allclose(dev[1], (2 * np.asarray(jax.random.uniform(key, o.shape)) - 1) * scale, atol=1e-6)
+    top = [float(np.abs(b).max()) for b in np.split(dev[1], np.cumsum([J, J, 3, 3, J]), -1)]
+    assert all(0.5 * n <= t <= 1.0001 * n for t, n in zip(top, tracker.NOISE)), top  # the previous action's scale is 0
+    print(f"noise: scale 0 leaves the observation as it was; scale 1 moves the blocks by at most {[round(t, 3) for t in top]}, within {tracker.NOISE}")
+
+    roll = np.asarray([[1, 0, 0], [0, np.cos(0.2), np.sin(0.2)], [0, -np.sin(0.2), np.cos(0.2)]], np.float32)
+    tilted = R @ pitch @ roll  # the base's yaw, then a tilt
+    rate, hold = (np.asarray(tracker.observation(p, q, qd, tilted, w, a_prev, h)) for h in (None, yaw + 0.5))
+    assert np.allclose(rate[:, -6:], (pitch @ roll).T[:, :2].reshape(-1), atol=1e-6) and (rate[:, :-6] == hold[:, :-6]).all()
+    assert np.abs(hold[:, -6:] - rate[:, -6:]).max() > 0.1 and np.allclose(tracker.observation(p, q, qd, R, w, a_prev, None)[:, -6:], [1, 0, 0, 1, 0, 0], atol=1e-6)
+    print(f"heading: without a commanded heading the relative rotation is the transposed tilt for {N} yaws, the identity when upright; the rest is unchanged")
+
     def state(t, yaw, a_last):  # the fields of sim.State that the tracker reads
         qpos = np.concatenate((np.zeros((N, 3)), yaw_quat(yaw), q), -1).astype(np.float32)
         return SimpleNamespace(t=np.asarray(t, np.int32), data=SimpleNamespace(qpos=qpos, qvel=np.concatenate((np.zeros((N, 3)), w, qd), -1)), a_last=a_last, cmd=cmd)
@@ -112,7 +129,14 @@ def test_tracker():
     h3 = np.asarray(mem3["hist"])
     assert (h3[:3] == h3[:3, -1:]).all() and (h3[3:, :-1] == np.asarray(mem2["hist"])[3:, 1:]).all()
     assert np.allclose(mem3["heading"], np.where(np.arange(N) < 3, yaw - 1.0, yaw + 2 * task.DT * cmd[:, 2]) + task.DT * cmd[:, 2], atol=1e-6)
-    print(f"step: heading from the base's yaw plus {task.DT} s of the commanded yaw rate per step; a history of {H} filled, shifted and reset")
+    # training's options in a step: the noisy observation at the base's own yaw enters the history; the heading integrates as before
+    a_r, mem_r = tracker.step(p, mem, state(np.full(N, 2), yaw + 1.0, np.asarray(a)), False, key, 1.0)
+    want = np.asarray(tracker.observation(p, q, qd, np.asarray(tracker.quat_to_mat(yaw_quat(yaw + 1.0))), w, np.asarray(a)[:, to_t], None, key, 1.0))
+    assert (np.asarray(mem_r["hist"][:, -1]) == want).all() and np.abs(want[:, -6:] - [1, 0, 0, 1, 0, 0]).max() <= 1.0001 * tracker.NOISE[5]
+    assert np.abs(want - second).max() > 0.1 and (np.asarray(mem_r["heading"]) == np.asarray(mem2["heading"])).all()
+    assert np.allclose(a_r, np.asarray(tracker.act(p, mem_r["hist"], tracker.goal(p, cmd)))[:, to_s])
+    print(f"step: heading from the base's yaw plus {task.DT} s of the commanded yaw rate per step; a history of {H} filled, shifted and reset; "
+          "with noise and without a commanded heading the action follows that observation")  # fmt: skip
 
 
 if __name__ == "__main__":

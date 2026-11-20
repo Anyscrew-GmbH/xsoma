@@ -226,8 +226,8 @@ A robot other than the G1 is a directory with two files, given as `python train.
   which marks it as a sole, and each foot has a body at the middle of the sole's underside, where the task reads its height.
 - `robot.json`: the robot's values of the task, which replace the G1's in [`xsoma/task.py`](xsoma/task.py) (the constants
   wrapped in `_robot`): `dof` (the joint names without `_joint`, in the MJCF's order), `default_q`, `kp`, `kd`, `effort` and
-  `pose_w` (one number per joint), `action_scale` (one number, or one per joint), `foot_points`, `feet`, `termination_bodies`
-  and `mass_bodies` (body names), `torso` (the body with the added mass) and `spawn_height`.
+  `pose_w` (one number per joint), `action_scale` (one number, or one per joint), `foot_points` and `feet` (the left foot's
+  body first), `termination_bodies` and `mass_bodies` (body names), `torso` (the body with the added mass) and `spawn_height`.
 
 The PD law is explicit at the 5 ms physics step, so every joint needs 2 kd h / I + kp h² / I < 4 (h the step, I the joint's
 inertia, at least its armature); a joint beyond that chatters between its torque limits. `--foot box` is the G1's box foot.

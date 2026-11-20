@@ -211,6 +211,8 @@ class Sim:
         self.coll_local, self.coll_frame, self.coll_radius = _points(m, tg, frames, bottom=False)
         self.sole_local, self.sole_frame, self.sole_radius = _points(m, sole_geoms, frames, bottom=True)
         self.kin = Kinematics(m, [m.body(b).name for b in frames])
+        y = np.asarray(self.kin.forward(jnp.zeros(3), jnp.eye(3), jnp.asarray(task.DEFAULT_Q))[0])[2:4, 1]  # the feet in the default pose
+        assert y[0] > y[1], "task.FEET must name the left foot first (task.feet_dy)"
         self.mass_ids = np.asarray([m.body(f"robot_{b}").id for b in task.MASS_BODIES])
         self.torso = m.body(f"robot_{task.TORSO}").id
 

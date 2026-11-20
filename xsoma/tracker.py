@@ -14,11 +14,14 @@ the same default pose and action scale, so that an action a means the joint targ
 
 What the tracker gets (XMimic's mdp.py, sim.py and motion.py define it):
   observation       q - q0 and qd in the tracker's joint order, the base's angular velocity and the direction of gravity in the
-                    base frame, the previous action, and the first two columns of R_base^T R_z(heading); no noise
+                    base frame, the previous action, and the first two columns of R_base^T R_z(heading). Training adds
+                    uniform noise per block (NOISE), the evaluation none
   history           the last H observations, oldest first; at an episode's first step all H are that step's observation
   goal              K future frames of (root displacement 3, rotation 6, velocity 3, angular velocity 3, q, 0.1 qd): v x, v y
                     and w z are the command, held over the K frames; the rest is neutral (zeros, the identity, q0); then a 1
-  heading           the base's yaw at the episode's first step, then the commanded yaw rate integrated at the policy rate
+  heading           "hold": the base's yaw at the episode's first step, then the commanded yaw rate integrated at the policy
+                    rate. "rate": the base's own yaw at every step, so the relative rotation carries the tilt only and the
+                    commanded yaw rate reaches the policy through the goal alone
   previous action   the simulator's last raw action, which is zero after a reset. The simulator's 0 or 1 step of action delay
                     acts on the tracker's action as on any policy's
 The simulator clips actions at +-100 (task.ACTION_CLIP) and does not squash them; the tracker's raw action passes unchanged.
@@ -44,6 +47,9 @@ from .rot import axis_angle_to_mat, mat_to_6d, mm3, quat_to_mat, tr3
 FRAME = 15  # a goal frame's entries before its joints: root displacement 3, rotation 6, velocity 3, angular velocity 3
 CMD = np.asarray((9, 10, 14))  # v x, v y, w z in a goal frame
 Z = np.asarray([0.0, 0.0, 1.0], np.float32)
+# the tracker's training values: uniform noise within +- these, per observation block (q, qd, angular velocity, gravity, previous
+# action, relative rotation)
+NOISE = (0.01, 0.5, 0.2, 0.05, 0.0, 0.05)
 
 
 def load(ckpt, meta, prefix=""):
@@ -74,13 +80,19 @@ def load(ckpt, meta, prefix=""):
     return p | {"q0": jnp.asarray(q0), "alpha": jnp.asarray(alpha), "to_tracker": jnp.asarray(to_tracker), "to_sim": jnp.asarray(np.argsort(to_tracker))}
 
 
-def observation(p, q, qd, R, w, a_prev, heading):
+def observation(p, q, qd, R, w, a_prev, heading, key=None, noise=1.0):
     """The tracker's observation (..., 3 J + 12) of robots with the joint state q, qd (the simulator's order), the base rotation
     R, the base's angular velocity w in the base frame, the previous tracker action (the tracker's order) and the commanded
-    heading (rad)."""
+    heading (rad; None: the base's own yaw). With `key`, uniform noise within +- `noise` x NOISE is added."""
     i = p["to_tracker"]
+    if heading is None:
+        heading = jnp.arctan2(R[..., 1, 0], R[..., 0, 0])
     rel = mat_to_6d(mm3(tr3(R), axis_angle_to_mat(Z, heading)))
-    return jnp.concatenate((q[..., i] - p["q0"], qd[..., i], w, task.projected_gravity(R), a_prev, rel), -1)
+    o = jnp.concatenate((q[..., i] - p["q0"], qd[..., i], w, task.projected_gravity(R), a_prev, rel), -1)
+    if key is None:
+        return o
+    J = q.shape[-1]
+    return o + (2 * jax.random.uniform(key, o.shape) - 1) * noise * np.repeat(np.asarray(NOISE, np.float32), (J, J, 3, 3, J, 6))
 
 
 def goal(p, cmd):
@@ -110,25 +122,27 @@ def memory(p, n):
     return {"hist": jnp.zeros((n, H, 3 * J + 12)), "heading": jnp.zeros((n,)), "t": jnp.full((n,), jnp.iinfo(jnp.int32).max)}
 
 
-def step(p, mem, s):
+def step(p, mem, s, hold=True, key=None, noise=1.0):
     """One policy step on the simulator state s: (the action for Sim.step, the memory for the next step). An env whose episode
-    counter did not advance has been reset: its history is refilled and its heading restarts at the base's yaw."""
+    counter did not advance has been reset: its history is refilled and its heading restarts at the base's yaw. `hold` False:
+    the observation refers to the base's own yaw instead of the heading; `key`, `noise`: see `observation`."""
     fresh = s.t <= mem["t"]
     qpos, qvel = s.data.qpos, s.data.qvel
     R = quat_to_mat(qpos[:, 3:7])
     heading = jnp.where(fresh, jnp.arctan2(R[:, 1, 0], R[:, 0, 0]), mem["heading"])
-    o = observation(p, qpos[:, 7:], qvel[:, 6:], R, qvel[:, 3:6], s.a_last[:, p["to_tracker"]], heading)
+    o = observation(p, qpos[:, 7:], qvel[:, 6:], R, qvel[:, 3:6], s.a_last[:, p["to_tracker"]], heading if hold else None, key, noise)
     hist = jnp.where(fresh[:, None, None], o[:, None], jnp.concatenate((mem["hist"][:, 1:], o[:, None]), 1))
     a = act(p, hist, goal(p, s.cmd))
     return a[:, p["to_sim"]], {"hist": hist, "heading": heading + task.DT * s.cmd[:, 2], "t": s.t}
 
 
-def history(p, qpos, qvel, a_last, heading, done):
+def history(p, qpos, qvel, a_last, heading, done, key=None, noise=1.0):
     """The observation histories (..., H, 3 J + 12) that `step` held at the last of H consecutive steps of an env, rebuilt from
     what a replay buffer keeps of every step (..., H, .): the simulator's qpos and qvel, the last raw action, the commanded
     heading of the step's observation and whether the step ended its episode. Steps of an earlier episode are replaced by the
-    first step of the last step's episode, as `step` fills a new history."""
-    o = observation(p, qpos[..., 7:], qvel[..., 6:], quat_to_mat(qpos[..., 3:7]), qvel[..., 3:6], a_last[..., p["to_tracker"]], heading)
+    first step of the last step's episode, as `step` fills a new history. `heading` None, `key`, `noise`: see `observation`;
+    the noise is drawn anew, once per stored step."""
+    o = observation(p, qpos[..., 7:], qvel[..., 6:], quat_to_mat(qpos[..., 3:7]), qvel[..., 3:6], a_last[..., p["to_tracker"]], heading, key, noise)
     H = o.shape[-2]
     first = jnp.max(jnp.arange(1, H) * (done[..., :-1] > 0), -1, initial=0)  # the window index where the last step's episode starts
     return jnp.take_along_axis(o, jnp.maximum(jnp.arange(H), first[..., None])[..., None], -2)

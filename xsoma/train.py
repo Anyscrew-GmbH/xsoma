@@ -16,7 +16,10 @@ the training time and the wall-clock time since launch.
 
 With `--init_tracker <checkpoint> --tracker_meta <meta.json>` the policy is a motion tracker's network (tracker.py), driven by
 the task's command and fine-tuned by the same updates; `--anchor` penalizes its distance from the initial tracker's actions and
-`--gait_clock 0` drops the reward term that follows the gait clock, which a tracker does not observe.
+`--gait_clock 0` drops the reward term that follows the gait clock, which a tracker does not observe. `--tracker_noise` scales
+the noise on the tracker's observation (1: as in the tracker's own training) and `--tracker_heading rate` relates that
+observation to the base's own yaw instead of a held heading. `--feet_cross`, for any policy, weighs a penalty on the feet
+crossing sideways in imagination's reward.
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -92,6 +95,14 @@ class Config:
     #                      the initial tracker on the same inputs (0: not computed)
     gait_clock: int = 1  # 0: imagination's reward leaves out feet_phase, the term that follows the gait clock (a tracker does not
     #                      observe the clock); the simulator's logged rewards and the evaluation keep the term
+    tracker_noise: float = 1.0  # with init_tracker: scale of the uniform noise on the tracker's observation in collection and in
+    #                             imagination; 1: the scales of the tracker's own training (tracker.NOISE), 0: no noise
+    tracker_heading: str = "hold"  # with init_tracker, the heading that the tracker's observation refers to. hold: the base's yaw
+    #                                at the episode's start plus the integrated commanded yaw rate | rate: the base's own yaw at
+    #                                every step, so the observation carries the tilt but no yaw error
+    feet_cross: float = 0.0  # weight of the penalty task.feet_cross on the feet crossing sideways, in imagination's reward only,
+    #                          times dt and the penalty curriculum's scale as Holosoma's penalties (0: not computed); the
+    #                          evaluation reports the crossing whatever the weight
     # runtime
     imag_unroll: int = 4  # unrolling of the imagination loop (speed saturates at 4; compile time grows with it)
     imag_remat: str = "none"  # rematerialization of the imagination steps: none | dots | full (less memory, slower)
@@ -222,7 +233,8 @@ class XSoma:
         s = carry["env"]
         noisy = (jnp.arange(c.num_envs) * c.det_share) % 1.0 >= c.det_share  # every 1 / det_share-th env acts without noise
         if c.init_tracker:
-            a, mem = tracker.step({**self.frozen, **carry["pi"]}, carry["mem"], s)
+            a, mem = tracker.step({**self.frozen, **carry["pi"]}, carry["mem"], s, c.tracker_heading == "hold",
+                                  jax.random.fold_in(key, 1) if c.tracker_noise else None, c.tracker_noise)  # fmt: skip
             carry = {**carry, "mem": mem}
         else:
             a = nets.pi_apply(carry["pi"], s.obs)
@@ -293,13 +305,14 @@ class XSoma:
         """Starting states for imagination: replayed states with their task context. A share (`cmd_fresh`) gets a freshly drawn
         command and gait frequency, with the gait phase recomputed, because in the real task a new command can arrive at any
         state (every 500 steps and after a reset). For a tracker policy a start also has `hist`, the observation history that
-        the tracker held there, rebuilt from the transitions before it."""
+        the tracker held there, rebuilt from the transitions before it (with new draws of the observation noise)."""
         c, B = self.cfg, self.cfg.pi_batch
         k_s, k_u, k_c = jax.random.split(key, 3)
         if c.init_tracker:
             w = rb.sample_histories(buf, k_s, B, self.H)
             start = rb.nest({k: v[:, -1] for k, v in w.items()})
-            start["hist"] = tracker.history(self.frozen, w["s_qpos"], w["s_qvel"], w["a_last"], w["heading"], w["done"])
+            start["hist"] = tracker.history(self.frozen, w["s_qpos"], w["s_qvel"], w["a_last"], w["heading"] if c.tracker_heading == "hold" else None,
+                                            w["done"], jax.random.fold_in(k_s, 1) if c.tracker_noise else None, c.tracker_noise)  # fmt: skip
         else:
             start = rb.nest(rb.sample_starts(buf, k_s, B))
         cmd, freq = task.sample_commands(k_c, B)
@@ -322,8 +335,8 @@ class XSoma:
         """The loss of the policy update: the negative mean discounted return of `horizon` imagined steps from `start`. A step
         follows the task's order: the policy acts on the observation, the world model moves the robot, the reward and the
         termination are read on the new state, then the gait phase advances and the command resamples every 500 steps. A tracker
-        policy (`pi`: its encoder and decoder) acts as in tracker.step, on its observation of the imagined state, the history
-        and the commanded heading; with `pi0`, the initial tracker, the loss gains `anchor` times the mean squared distance
+        policy (`pi`: its encoder and decoder) acts as in tracker.step, on its noisy observation of the imagined state, the
+        history and the commanded heading; with `pi0`, the initial tracker, the loss gains `anchor` times the mean squared distance
         between the two policies' actions on the same inputs (held constant for it), over the steps that count for the return."""
         c, B = self.cfg, self.cfg.pi_batch
         bf16 = c.mm_bf16 in ("imag", "all")
@@ -339,8 +352,8 @@ class XSoma:
             pen = None
             if c.init_tracker:
                 prev, heading = mem  # the H - 1 observations before this step's, the commanded heading
-                # ponytail: no observation noise on the tracker's inputs, here and in collect_step; add the tracker's own if the policy loses its tolerance of sensor noise
-                o = tracker.observation(pi, S[4], S[5], S[1], v.robot.w, a_last[:, pi["to_tracker"]], heading)
+                o = tracker.observation(pi, S[4], S[5], S[1], v.robot.w, a_last[:, pi["to_tracker"]], heading if c.tracker_heading == "hold" else None,
+                                        k_o if c.tracker_noise else None, c.tracker_noise)  # fmt: skip
                 # ponytail: the goal is encoded at every step though the command changes every 500; encode per rollout and at resamples if imagination is too slow
                 hist, g = jnp.concatenate((prev, o[:, None]), 1), tracker.goal(pi, cmd)
                 a = tracker.act(pi, hist, g, out_bf16=bf16)[:, pi["to_sim"]]
@@ -359,6 +372,8 @@ class XSoma:
             S1 = nets.wm_step(wm, wm_b, S, v.height, v.soles, target_q(tgt), xi, task.DT, out_bf16=bf16)
             v1 = self.sim.view_state(S1, heights)
             r = task.reward(task.reward_terms(v1.robot, v1.foot_h, a, a_last, cmd, phase), rcfg, scale)
+            if c.feet_cross:  # weighted as task.weighted weighs a penalty
+                r = r - task.DT * c.feet_cross * scale * task.feet_cross(v1.robot)
             d = self.termination(v1.clearance)
             t1 = t + 1
             phase1 = task.gait_phase(t1, freq, offset, cmd)
@@ -494,6 +509,7 @@ def main(argv=None):
     # the robot is read when xsoma.task is imported: train.py passes the flag on in time, other entry points set the variable
     assert cfg.robot_dir == (task.ROBOT_DIR or ""), "--robot_dir needs train.py, or XSOMA_ROBOT_DIR set to the same directory"
     assert bool(cfg.init_tracker) == bool(cfg.tracker_meta) and (cfg.init_tracker or not cfg.anchor), "--init_tracker and --tracker_meta go together, --anchor with them"
+    assert cfg.tracker_heading in ("hold", "rate") and cfg.feet_cross >= 0, "--tracker_heading is hold or rate, --feet_cross is not negative"
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]
     if flags:  # XLA reads XLA_FLAGS when its backend starts, so they are set before XSoma(cfg) first uses the GPU
         os.environ["XLA_FLAGS"] = " ".join([os.environ.get("XLA_FLAGS", "")] + flags).strip()

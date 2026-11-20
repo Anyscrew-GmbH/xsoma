@@ -73,6 +73,9 @@ MAX_EPISODE = 1000  # time-out once the step counter exceeds it: an un-terminate
 # bodies of the compiled scene (prefix "robot_"): frames the task reads and the bodies whose ground contact ends an episode
 FOOT_POINTS = _robot("foot_points", ("left_foot_contact_point", "right_foot_contact_point"))
 FEET = _robot("feet", ("left_ankle_roll_link", "right_ankle_roll_link"))
+# m: feet_cross penalizes the left foot being less than this to the left of the right one (the stance width itself follows from
+# the robot's MJCF and default pose: 0.24 m for the G1)
+FEET_CROSS_MARGIN = 0.10
 TERMINATION_BODIES = _robot("termination_bodies", ("pelvis", "left_hip_pitch_link", "left_hip_roll_link", "left_hip_yaw_link", "right_hip_pitch_link",
                       "right_hip_roll_link", "right_hip_yaw_link", "left_shoulder_pitch_link", "left_shoulder_roll_link",
                       "left_shoulder_yaw_link", "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link"))  # fmt: skip
@@ -87,7 +90,7 @@ class Robot(NamedTuple):
     q: jax.Array  # (N, J)
     qd: jax.Array  # (N, J)
     foot_p: jax.Array  # (N, 2, 3) world positions of the foot contact points (left, right)
-    feet_p: jax.Array  # (N, 2, 3) world positions of the ankle-roll links
+    feet_p: jax.Array  # (N, 2, 3) world positions of the ankle-roll links (left, right)
     feet_R: jax.Array  # (N, 2, 3, 3) rotations of the ankle-roll links
 
 
@@ -204,15 +207,26 @@ PPO_REWARD = RewardCfg()
 FAST_SAC_REWARD = RewardCfg(alive=10.0)  # the presets differ only in the alive weight
 
 
+def feet_dy(robot: Robot):
+    """How far the left foot is to the left of the right one, in the pelvis heading's frame (m): the stance width, negative when
+    the feet are crossed. Left and right are the order of FEET."""
+    yaw = jnp.arctan2(robot.R[:, 1, 0], robot.R[:, 0, 0])
+    dx = robot.feet_p[:, 0, 0] - robot.feet_p[:, 1, 0]
+    dy = robot.feet_p[:, 0, 1] - robot.feet_p[:, 1, 1]
+    return jnp.cos(yaw) * dy - jnp.sin(yaw) * dx
+
+
+def feet_cross(robot: Robot):
+    """The feet-crossing penalty term, which is not Holosoma's (train.py --feet_cross): max(0, FEET_CROSS_MARGIN - feet_dy)."""
+    return jnp.maximum(0.0, FEET_CROSS_MARGIN - feet_dy(robot))
+
+
 def reward_terms(robot: Robot, foot_heights, a, a_prev, cmd, phase):
     """Unweighted terms of one step. foot_heights (N, 2): foot contact points over the terrain; phase / cmd: the ones the
     policy observed when it chose `a` (spec 6, timing)."""
     v_b = jnp.einsum("nji,nj->ni", robot.R, robot.v)  # velocity in the pelvis frame
     g = projected_gravity(robot.R)
-    yaw = jnp.arctan2(robot.R[:, 1, 0], robot.R[:, 0, 0])
-    dx = robot.feet_p[:, 0, 0] - robot.feet_p[:, 1, 0]
-    dy = robot.feet_p[:, 0, 1] - robot.feet_p[:, 1, 1]
-    lateral = jnp.abs(jnp.cos(yaw) * dy - jnp.sin(yaw) * dx)  # the feet's sideways distance, in the pelvis heading's frame
+    lateral = jnp.abs(feet_dy(robot))  # the feet's sideways distance, in the pelvis heading's frame
     g_feet = jnp.einsum("nfji,j->nfi", robot.feet_R, GRAVITY)  # gravity in each foot's frame (zero x and y when flat)
     err_h = jnp.sum(jnp.square(foot_heights - swing_height(phase)), -1)  # squared foot height error against the gait reference
     return {
