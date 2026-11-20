@@ -84,6 +84,7 @@ CONTACT_FORCE = 1.0  # N: a net contact force above this on a termination body e
 # group (scene.py); these contacts are simulated but do not count for the termination (sim.py)
 SELF_COLLISION = _ROBOT.get("self_collision") if ROBOT_DIR else None
 SELF_CLEARANCE_MARGIN = 0.02  # m: self_clearance penalizes every pair of the two groups' colliders that is closer than this
+FOOT_CLEARANCE_HEIGHT = 0.06  # m: foot_clearance penalizes a foot that moves sideways or forward lower than this over the terrain
 
 
 class Robot(NamedTuple):
@@ -113,10 +114,13 @@ GAIT_FREQ = (0.8, 1.2)  # Hz: 1 / gait_period (a period of 1 s), plus or minus a
 STAND_PHASE = math.pi  # the gait phase of both feet while standing
 
 
-def sample_commands(key, n):
-    """Draw n commands [vx, vy, wz] and gait frequencies; every resample redraws both (spec 5)."""
+def sample_commands(key, n, scale=None):
+    """Draw n commands [vx, vy, wz] and gait frequencies; every resample redraws both (spec 5). `scale`, which is not
+    Holosoma's (train.py --cmd_scale): three factors on the ranges of vx, vy and wz."""
     kc, ks, kf = jax.random.split(key, 3)
     cmd = jax.random.uniform(kc, (n, 3), minval=-CMD_RANGE, maxval=CMD_RANGE)
+    if scale is not None:
+        cmd = cmd * jnp.asarray(scale, jnp.float32)
     cmd = jnp.where(jax.random.uniform(ks, (n, 1)) <= STAND_PROB, 0.0, cmd)
     return cmd, jax.random.uniform(kf, (n,), minval=GAIT_FREQ[0], maxval=GAIT_FREQ[1])
 
@@ -229,6 +233,15 @@ def self_clearance(distance):
     """The self-clearance penalty term, which is not Holosoma's (train.py --self_clearance): over the pairs of `self_collision`
     colliders, with their signed distances (sim.SelfDistance), the sum of max(0, SELF_CLEARANCE_MARGIN - distance)."""
     return jnp.maximum(0.0, SELF_CLEARANCE_MARGIN - distance).sum(-1)
+
+
+def foot_clearance(sole_h, step_xy, height=FOOT_CLEARANCE_HEIGHT):
+    """The swing-clearance penalty term, which is not Holosoma's and needs no gait clock (train.py --foot_clearance): per foot,
+    how far its lowest sole point is below `height` over the terrain (`sole_h`, (N, 2)) times its horizontal speed, from the
+    displacement `step_xy` (N, 2, 2) of its contact point in one policy step; summed over the feet. Zero for a foot that
+    stands still and for one lifted above `height`, however it moves."""
+    speed = jnp.sqrt(jnp.sum(jnp.square(step_xy), -1) + 1e-12) / DT  # the 1e-12 keeps the gradient finite at rest
+    return jnp.sum(jnp.maximum(0.0, height - sole_h) * speed, -1)
 
 
 def reward_terms(robot: Robot, foot_heights, a, a_prev, cmd, phase):

@@ -21,7 +21,9 @@ the noise on the tracker's observation (1: as in the tracker's own training) and
 observation to the base's own yaw instead of a held heading. `--feet_cross`, for any policy, weighs a penalty on the feet
 crossing sideways in imagination's reward. For a robot with `self_collision` groups (task.py), `--self_clearance` weighs a
 penalty on the two groups coming within 2 cm of each other, and `--self_clearance_term <m>` ends an imagined rollout once they
-overlap by more than that depth; both act in imagination only.
+overlap by more than that depth; both act in imagination only. `--foot_clearance`, for any policy, weighs a penalty in
+imagination's reward on a foot that moves horizontally lower than `--foot_clearance_height` over the terrain. `--cmd_scale x,y,z`
+scales the command ranges of vx, vy and wz, and `--push_vel` sets the size of the pushes in collection.
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -61,6 +63,11 @@ class Config:
     #                           makes a policy that looks 1 s ahead value not falling
     sole_friction: int = 1  # friction randomization reaches the soles (Holosoma's MuJoCo backends keep them at 0.8)
     random_start: int = 1  # episode counters start uniform in [0, 1000), so episodes end at different times (as Holosoma's PPO)
+    cmd_scale: str = ""  # "x,y,z": factors on the command ranges of vx, vy and wz, in collection and in imagination, e.g.
+    #                      "1,0.5,1" for sideways commands up to 0.5 m/s ("": Holosoma's U[-1, 1]); the evaluation after training
+    #                      keeps Holosoma's ranges (evaluate.py --cmd_scale)
+    push_vel: float = task.PUSH_VEL  # m/s: a push in collection sets the root's (vx, vy) to U[-push_vel, push_vel] each; the
+    #                                  evaluation keeps Holosoma's pushes
     # schedule
     minutes: float = 15.0  # training time, start-up excluded
     env_steps: int = 1  # env steps of all envs per iteration
@@ -110,6 +117,10 @@ class Config:
     #                              imagination's reward only and weighted as feet_cross is (0: not computed)
     self_clearance_term: float = 0.0  # > 0: an imagined rollout also ends, as in a fall, at a step in which a pair of those
     #                                   colliders overlaps by more than this many meters (0: off); the simulator ends no episode
+    foot_clearance: float = 0.0  # weight of the penalty task.foot_clearance on a foot that moves horizontally while its lowest
+    #                              sole point is less than foot_clearance_height over the terrain, in imagination's reward only
+    #                              and weighted as feet_cross is (0: not computed); it needs no gait clock
+    foot_clearance_height: float = task.FOOT_CLEARANCE_HEIGHT  # m
     # runtime
     imag_unroll: int = 4  # unrolling of the imagination loop (speed saturates at 4; compile time grows with it)
     imag_remat: str = "none"  # rematerialization of the imagination steps: none | dots | full (less memory, slower)
@@ -165,7 +176,10 @@ class XSoma:
         self.cfg = c = cfg
         set_jax(c.jax_cache)
         self.sim = Sim(SimCfg(num_envs=c.num_envs, terrain=c.terrain, terrain_scale=c.terrain_scale, foot=c.foot, preset=c.preset,
-                              sole_friction=bool(c.sole_friction), random_start=bool(c.random_start), seed=42 + c.seed))  # fmt: skip
+                              sole_friction=bool(c.sole_friction), random_start=bool(c.random_start), seed=42 + c.seed,
+                              cmd_scale=self.cmd_scale, push_vel=c.push_vel))  # fmt: skip
+        if c.foot_clearance:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
+            self.sole_foot = np.asarray(self.sim.sole_frame) == np.arange(2, 4)[:, None]
         self.reward_cfg = self.sim.reward_cfg if c.gait_clock else dataclasses.replace(self.sim.reward_cfg, feet_phase=0.0)  # imagination's reward
         self.ckpt_extra = None  # a tracker policy: what save_ckpt writes besides the networks, the normalizers and the metadata as loaded
         if c.init_tracker:
@@ -177,6 +191,12 @@ class XSoma:
         J = self.J
         # error floors of the world-model loss for every state dimension: ERR_FLOOR's four groups, then q and qd
         self.err_floor = np.concatenate([np.full((n,), v, np.float32) for n, v in ERR_FLOOR] + [np.full((J,), 3e-3, np.float32), np.full((J,), 5e-2, np.float32)])
+
+    @property
+    def cmd_scale(self):
+        """--cmd_scale as three factors for task.sample_commands; None without the option."""
+        c = self.cfg.cmd_scale
+        return tuple(float(x) for x in c.split(",")) if c else None
 
     # ------------------------------------------------------------------ state
     def init(self, key):
@@ -322,7 +342,7 @@ class XSoma:
                                             w["done"], jax.random.fold_in(k_s, 1) if c.tracker_noise else None, c.tracker_noise)  # fmt: skip
         else:
             start = rb.nest(rb.sample_starts(buf, k_s, B))
-        cmd, freq = task.sample_commands(k_c, B)
+        cmd, freq = task.sample_commands(k_c, B, self.cmd_scale)
         fresh = jax.random.uniform(k_u, (B,)) < c.cmd_fresh
         start["cmd"] = jnp.where(fresh[:, None], cmd, start["cmd"])
         start["freq"] = jnp.where(fresh, freq, start["freq"])
@@ -337,6 +357,12 @@ class XSoma:
         soft = jax.nn.sigmoid(-cmin / self.cfg.term_tau)
         hard = (cmin < 0).astype(jnp.float32)
         return hard + soft - jax.lax.stop_gradient(soft)
+
+    def foot_clearance(self, v, v1):
+        """task.foot_clearance of the step from the view `v` to `v1`: each foot's lowest sole point over the terrain after the
+        step, and how far its contact point moved."""
+        low = jnp.where(self.sole_foot, v1.soles[..., None, :], jnp.inf).min(-1)
+        return task.foot_clearance(low, (v1.robot.foot_p - v.robot.foot_p)[..., :2], self.cfg.foot_clearance_height)
 
     def imagine(self, pi, wm, wm_b, start, keys, scale, heights, pi0=None):
         """The loss of the policy update: the negative mean discounted return of `horizon` imagined steps from `start`. A step
@@ -381,6 +407,8 @@ class XSoma:
             r = task.reward(task.reward_terms(v1.robot, v1.foot_h, a, a_last, cmd, phase), rcfg, scale)
             if c.feet_cross:  # weighted as task.weighted weighs a penalty
                 r = r - task.DT * c.feet_cross * scale * task.feet_cross(v1.robot)
+            if c.foot_clearance:  # weighted as task.weighted weighs a penalty
+                r = r - task.DT * c.foot_clearance * scale * self.foot_clearance(v, v1)
             d = self.termination(v1.clearance)
             if c.self_clearance or c.self_clearance_term:
                 gap = self.sim.self_distance(S1)
@@ -390,7 +418,7 @@ class XSoma:
                     d = 1 - (1 - d) * (1 - self.termination(gap + c.self_clearance_term))
             t1 = t + 1
             phase1 = task.gait_phase(t1, freq, offset, cmd)
-            cmd2, freq2 = task.sample_commands(k_c, B)
+            cmd2, freq2 = task.sample_commands(k_c, B, self.cmd_scale)
             new = t1 % task.RESAMPLE == 0
             cmd1, freq1 = jnp.where(new[:, None], cmd2, cmd), jnp.where(new, freq2, freq)
             return (S1, v1, a, cmd1, freq1, phase1, t1, mem), (r, d, pen)
@@ -524,6 +552,8 @@ def main(argv=None):
     assert bool(cfg.init_tracker) == bool(cfg.tracker_meta) and (cfg.init_tracker or not cfg.anchor), "--init_tracker and --tracker_meta go together, --anchor with them"
     assert cfg.tracker_heading in ("hold", "rate") and cfg.feet_cross >= 0, "--tracker_heading is hold or rate, --feet_cross is not negative"
     assert min(cfg.self_clearance, cfg.self_clearance_term) >= 0, "--self_clearance and --self_clearance_term are not negative"
+    assert min(cfg.foot_clearance, cfg.foot_clearance_height, cfg.push_vel) >= 0, "--foot_clearance, --foot_clearance_height and --push_vel are not negative"
+    assert not cfg.cmd_scale or len(cfg.cmd_scale.split(",")) == 3, "--cmd_scale is three factors, for vx, vy and wz: 1,0.5,1"
     assert task.SELF_COLLISION or cfg.self_clearance == cfg.self_clearance_term == 0, "--self_clearance and --self_clearance_term need robot.json's self_collision"
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]
     if flags:  # XLA reads XLA_FLAGS when its backend starts, so they are set before XSoma(cfg) first uses the GPU

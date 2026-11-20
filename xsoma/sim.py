@@ -54,6 +54,9 @@ class SimCfg:
     preset: str = "ppo"  # rewards and penalty curriculum: ppo (g1_29dof) | fast_sac (g1_29dof_fast_sac)
     sole_friction: bool = True  # friction randomization reaches the soles (Holosoma's MuJoCo backends: fixed 0.8)
     random_start: bool = False  # PPO's init_at_random_ep_len: initial episode counters uniform in [0, 1000)
+    max_episode: int = task.MAX_EPISODE  # time-out once the episode counter exceeds it (evaluate.py --steps runs longer episodes)
+    cmd_scale: tuple | None = None  # three factors on the command ranges of vx, vy and wz (task.sample_commands); None: Holosoma's
+    push_vel: float = task.PUSH_VEL  # a push sets the root's world (vx, vy) to U[-push_vel, push_vel] each
     nconmax: int = 96  # contacts per world (the size of Holosoma's MuJoCo Warp contact pool)
     njmax: int = 576  # constraint rows per world (Holosoma: max(6 x 96, 4 nv))
     naccdmax: int = 0  # heightfield (CCD) contacts per world; 0: nconmax
@@ -129,6 +132,7 @@ class Transition(NamedTuple):
     critic_final: jax.Array  # (N, 103) critic observation of the final state (for time-out bootstraps; XSoma has no critic)
     clearance: jax.Array  # (N, n) terrain clearance of the termination colliders (imagination's termination geometry)
     stats: dict
+    force: jax.Array = None  # (N, n) net contact force (N) on each termination collider: which body ended the episode
 
 
 class View(NamedTuple):
@@ -371,7 +375,7 @@ class Sim:
         scale, avg_len = task.curriculum_step(self.curriculum_cfg, s.scale, s.avg_len, jnp.zeros((N,)), jnp.zeros((N,), bool), N)
         s, _ = self.step(s._replace(scale=scale, avg_len=avg_len), jnp.zeros((N, J)))
         if self.cfg.random_start:  # episodes then end at different times
-            s = s._replace(t=jax.random.randint(k_t, (N,), 0, task.MAX_EPISODE))
+            s = s._replace(t=jax.random.randint(k_t, (N,), 0, self.cfg.max_episode))
         return s
 
     # ------------------------------------------------------------------ one policy step
@@ -427,7 +431,7 @@ class Sim:
         kp = jax.random.uniform(k[3], (N, J), minval=task.GAIN_SCALE[0], maxval=task.GAIN_SCALE[1])
         kd = jax.random.uniform(k[4], (N, J), minval=task.GAIN_SCALE[0], maxval=task.GAIN_SCALE[1])
         delay = jax.random.randint(k[5], (N,), 0, task.MAX_DELAY + 1)
-        cmd, freq = task.sample_commands(k[6], N)
+        cmd, freq = task.sample_commands(k[6], N, self.cfg.cmd_scale)
         return qpos, qvel, kp, kd, delay, cmd, freq, task.sample_phase_offsets(k[7], N), self._push_interval(k[8])
 
     def _push_interval(self, key):
@@ -461,8 +465,9 @@ class Sim:
         rb, foot_h, clearance = v.robot, v.foot_h, v.clearance
         # a physics failure (MuJoCo Warp's heightfield contacts can blow up under violent motion) ends the episode unrewarded
         diverged = ~(jnp.isfinite(s1_qpos).all(-1) & jnp.isfinite(s1_qvel).all(-1)) | (jnp.abs(s1_qvel) > DIVERGED).any(-1)
-        terminated = self.contact_termination(data) | diverged
-        timeout = t > task.MAX_EPISODE
+        force = jnp.linalg.norm(self.collider_forces(data), axis=-1)
+        terminated = (force > task.CONTACT_FORCE).any(-1) | diverged
+        timeout = t > self.cfg.max_episode
         done = terminated | timeout
         parts = task.weighted(task.reward_terms(rb, foot_h, a, s.a_last, s.cmd, s.phase), self.reward_cfg, s.scale)
         parts = jnp.where(diverged[:, None], 0.0, jnp.stack([parts[k] for k in task.TERMS], -1))
@@ -473,7 +478,7 @@ class Sim:
         # term_geom: how often imagination's geometric termination (a collider below the terrain) agrees with the contact one;
         # nacon: the share of the contact pool in use
         stats = {"reward": reward.mean(), "done": fin.sum(), "terminated": terminated.sum().astype(jnp.float32),
-                 "len_sum": (fin * t).sum(), "rew_sums": (fin[:, None] * ep_sums).sum(0) / (task.MAX_EPISODE * task.DT),
+                 "len_sum": (fin * t).sum(), "rew_sums": (fin[:, None] * ep_sums).sum(0) / (self.cfg.max_episode * task.DT),
                  "term_geom": (((clearance.min(-1) < 0) == terminated) | diverged).mean(), "diverged": diverged.sum().astype(jnp.float32),
                  "nacon": data._impl.nacon[0] / data._impl.contact__dist.shape[0]}  # fmt: skip
         s1 = s._replace(data=data, a_last=a, t=t, ep_sums=ep_sums)
@@ -485,14 +490,14 @@ class Sim:
         # gait phase with the current command, then command resampling
         phase = task.gait_phase(s1.t, s1.freq, s1.offset, s1.cmd)
         resample = s1.t % task.RESAMPLE == 0
-        cmd2, freq2 = task.sample_commands(k_cmd, N)
+        cmd2, freq2 = task.sample_commands(k_cmd, N, self.cfg.cmd_scale)
         cmd, freq = jnp.where(resample[:, None], cmd2, s1.cmd), jnp.where(resample, freq2, s1.freq)
 
         # pushes
         push_t = s1.push_t + 1
         push = push_t == s1.push_at
         qvel = s1.data.qvel
-        vxy = task.PUSH_VEL * jax.random.uniform(k_push, (N, 2), minval=-1.0, maxval=1.0)
+        vxy = self.cfg.push_vel * jax.random.uniform(k_push, (N, 2), minval=-1.0, maxval=1.0)
         qvel = qvel.at[:, :2].set(jnp.where(push[:, None], vxy, qvel[:, :2]))
         push_at = jnp.where(push, self._push_interval(k_push_at), s1.push_at)
         data = s1.data.replace(qvel=qvel)
@@ -505,5 +510,5 @@ class Sim:
         s2 = s1._replace(data=data, obs=obs, critic=critic, cmd=cmd, freq=freq, phase=phase, push_t=jnp.where(push, 0, push_t), push_at=push_at,
                          key=key)  # fmt: skip
         tr = Transition(s.data.qpos, s.data.qvel, target, s1_qpos, s1_qvel, reward, terminated, timeout & ~terminated, diverged, parts,
-                        critic_final, clearance, stats)  # fmt: skip
+                        critic_final, clearance, stats, force)  # fmt: skip
         return s2, tr
