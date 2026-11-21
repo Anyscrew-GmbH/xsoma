@@ -240,7 +240,7 @@ def check_finetune(d, heading):
     if heading == "rate":
         with open(os.path.join(run, "config.json"), "w") as f:
             json.dump({"tracker_heading": heading}, f)
-    with mock.patch.object(evaluate, "make_sim", lambda n, *a: FakeSim(SimCfg(num_envs=n))), contextlib.redirect_stdout(io.StringIO()) as out:
+    with mock.patch.object(evaluate, "make_sim", lambda n, *a, **k: FakeSim(SimCfg(num_envs=n))), contextlib.redirect_stdout(io.StringIO()) as out:
         evaluate.main([run] + opts)
         if heading == "rate":
             evaluate.main([run, "--tracker_heading", "hold", "--out", "hold"] + opts)
