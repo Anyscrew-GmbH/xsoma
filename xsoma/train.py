@@ -23,7 +23,9 @@ crossing sideways in imagination's reward. For a robot with `self_collision` gro
 penalty on the two groups coming within 2 cm of each other, and `--self_clearance_term <m>` ends an imagined rollout once they
 overlap by more than that depth; both act in imagination only. `--foot_clearance`, for any policy, weighs a penalty in
 imagination's reward on a foot that moves horizontally lower than `--foot_clearance_height` over the terrain. `--cmd_scale x,y,z`
-scales the command ranges of vx, vy and wz, and `--push_vel` sets the size of the pushes in collection.
+scales the command ranges of vx, vy and wz, and `--push_vel` sets the size of the pushes in collection (0: none).
+`--term_penalty` charges an imagined fall a fixed amount, `--fall_starts` starts a share of the imagined rollouts shortly
+before a real fall (`--fall_lead` steps at most), and `--tilt_term <rad>` ends an imagined rollout at that tilt of the base already.
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -66,7 +68,7 @@ class Config:
     cmd_scale: str = ""  # "x,y,z": factors on the command ranges of vx, vy and wz, in collection and in imagination, e.g.
     #                      "1,0.5,1" for sideways commands up to 0.5 m/s ("": Holosoma's U[-1, 1]); the evaluation after training
     #                      keeps Holosoma's ranges (evaluate.py --cmd_scale)
-    push_vel: float = task.PUSH_VEL  # m/s: a push in collection sets the root's (vx, vy) to U[-push_vel, push_vel] each; the
+    push_vel: float = task.PUSH_VEL  # m/s: a push in collection sets the root's (vx, vy) to U[-push_vel, push_vel] each (0: none); the
     #                                  evaluation keeps Holosoma's pushes
     # schedule
     minutes: float = 15.0  # training time, start-up excluded
@@ -96,6 +98,16 @@ class Config:
     det_share: float = 0.5  # share of envs that collect without noise, spread over the terrain; when every collected action is
     #                         noisy, policies trained for about 45 minutes or more come to rely on the noise and fall without it
     cmd_fresh: float = 0.5  # share of imagined rollouts that start with a freshly drawn command
+    term_penalty: float = 0.0  # subtracted from an imagined rollout's return at the step that ends it in a fall (discounted as a
+    #                            reward of that step). Without it a fall costs only the rewards of the horizon's remaining steps,
+    #                            which is next to nothing where the penalties cancel the alive reward
+    fall_starts: float = 0.0  # share of the imagined rollouts that start in the `horizon` steps before a real fall of their env
+    #                           (while the replay buffer holds one), instead of anywhere; uniform starts hit such a state rarely
+    fall_lead: int = 0  # with fall_starts: those rollouts start up to this many steps before the fall (0: `horizon` steps)
+    tilt_term: float = 0.0  # > 0: an imagined rollout also ends, as in a fall, once the base's up axis is tilted by more than this
+    #                         many radians from the vertical (0: off). A falling robot passes such a tilt some tenths of a second
+    #                         before it touches the ground, so more of the rollouts that lead to a fall end within the horizon; the
+    #                         simulator ends no episode for it
     term_tau: float = 0.02  # width (m) of the sigmoid that gives imagined terminations their gradient; their value stays exact
     init_tracker: str = ""  # a tracker checkpoint (tracker.py): the policy is the tracker's network; its encoder and decoder are
     #                         trained, its normalizers stay as loaded. "": XSoma's own policy. Layout 1GPU only
@@ -336,12 +348,12 @@ class XSoma:
         c, B = self.cfg, self.cfg.pi_batch
         k_s, k_u, k_c = jax.random.split(key, 3)
         if c.init_tracker:
-            w = rb.sample_histories(buf, k_s, B, self.H)
+            w = rb.sample_histories(buf, k_s, B, self.H, c.fall_starts, c.fall_lead or c.horizon)
             start = rb.nest({k: v[:, -1] for k, v in w.items()})
             start["hist"] = tracker.history(self.frozen, w["s_qpos"], w["s_qvel"], w["a_last"], w["heading"] if c.tracker_heading == "hold" else None,
                                             w["done"], jax.random.fold_in(k_s, 1) if c.tracker_noise else None, c.tracker_noise)  # fmt: skip
         else:
-            start = rb.nest(rb.sample_starts(buf, k_s, B))
+            start = rb.nest(rb.sample_starts(buf, k_s, B, c.fall_starts, c.fall_lead or c.horizon))
         cmd, freq = task.sample_commands(k_c, B, self.cmd_scale)
         fresh = jax.random.uniform(k_u, (B,)) < c.cmd_fresh
         start["cmd"] = jnp.where(fresh[:, None], cmd, start["cmd"])
@@ -410,6 +422,8 @@ class XSoma:
             if c.foot_clearance:  # weighted as task.weighted weighs a penalty
                 r = r - task.DT * c.foot_clearance * scale * self.foot_clearance(v, v1)
             d = self.termination(v1.clearance)
+            if c.tilt_term:  # S1[1]: the base's rotation matrix, whose last entry is the cosine of its tilt (width: term_tau, in cosine)
+                d = 1 - (1 - d) * (1 - self.termination((S1[1][..., 2, 2] - np.cos(c.tilt_term))[..., None]))
             if c.self_clearance or c.self_clearance_term:
                 gap = self.sim.self_distance(S1)
                 if c.self_clearance:  # weighted as task.weighted weighs a penalty
@@ -433,7 +447,7 @@ class XSoma:
         alive = jnp.cumprod(1 - d, 0)
         alive_before = jnp.concatenate((jnp.ones_like(alive[:1]), alive[:-1]), 0)  # a step's reward counts if alive before it
         disc = c.gamma ** jnp.arange(c.horizon, dtype=jnp.float32)[:, None]
-        G = (disc * alive_before * r).sum(0)
+        G = (disc * alive_before * (r - c.term_penalty * d)).sum(0)
         # statistics: mean return, mean reward per step, and the share of rollouts still alive at the end of the horizon
         loss, stats = -G.mean(), {"G": G.mean(), "r": (alive_before * r).sum(0).mean() / c.horizon, "surv": alive[-1].mean()}
         if pen is not None:

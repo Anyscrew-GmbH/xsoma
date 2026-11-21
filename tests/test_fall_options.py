@@ -1,5 +1,5 @@
-"""Options against falls (run: python tests/test_fall_options.py, or pytest): train.py's --foot_clearance, --cmd_scale and
---push_vel, and evaluate.py's --cmd_scale. CPU only.
+"""Options against falls (run: python tests/test_fall_options.py, or pytest): train.py's --foot_clearance, --cmd_scale,
+--push_vel, --term_penalty, --fall_starts, --fall_lead and --tilt_term, and evaluate.py's --cmd_scale and --push_vel. CPU only.
 
   term      task.foot_clearance: (height - lowest sole point) x horizontal speed for a low foot that moves, nothing for one
             above the height, next to nothing at rest, where the gradient stays finite; lifting a low moving foot lowers it
@@ -14,7 +14,13 @@
             evaluate.py --cmd_scale reaches its simulator and the record, which has no such entry without it
   step      the real Sim.step of the G1 (test_falls.py's hand-made physics) with `cmd_scale`: every command, at the start,
             after a reset and after a resample, is the plain simulator's times the factors; with `push_vel` 2: every push
-            leaves twice the plain one's velocity
+            leaves twice the plain one's velocity; with `push_vel` 0 there is no push and no velocity is overwritten
+  falls     buffer._before_falls on a hand-made ring buffer that has wrapped: every redrawn start lies in the K steps up to a
+            fall of its env and is not younger than asked, all such transitions get drawn, the rest stay as drawn, and so
+            does everything while the buffer holds no fall; sample_starts with the share on the stand-in's buffer keeps it.
+            --fall_lead narrows that to its number of steps. --term_penalty P: the loss gains P x the discounted share of
+            rollouts at the step that ends them. --tilt_term: every imagined step asks for a second termination, of the
+            cosine of the new state's tilt minus the angle's cosine, and a rollout whose base starts tilted further ends at once
 """
 
 import contextlib
@@ -35,6 +41,7 @@ import numpy as np  # noqa: E402
 import test_falls as tfalls  # noqa: E402
 import test_finetune as tf  # noqa: E402
 
+from xsoma import buffer as rb  # noqa: E402
 from xsoma import evaluate, task, train  # noqa: E402
 from xsoma.sim import SimCfg, unflatten  # noqa: E402
 
@@ -112,6 +119,70 @@ def check_imagine():
     return carry, start, args
 
 
+def test_before_falls():
+    T, N, K, lo = 12, 3, 3, 2
+    term = np.zeros((T, N), np.float32)
+    ptr = 5  # the oldest step is row 5: age a is row (5 + a) % 12
+    falls = [(4, 0), (9, 2), (11, 2), (0, 1)]  # (age, env); the last one is younger than `lo` allows a start to be
+    for a, e in falls:
+        term[(ptr + a) % T, e] = 1
+    buf = {"term": jnp.asarray(term), "s_qpos": jnp.zeros((T, N, 1)), "ptr": jnp.asarray(ptr), "size": jnp.asarray(T)}
+    want = {(a - k, e) for a, e in falls for k in range(K) if a - k >= lo}
+    age0, env0 = jnp.full((400,), 7), jnp.full((400,), 1)
+    age, env = (np.asarray(x) for x in rb._before_falls(buf, jax.random.PRNGKey(0), age0, env0, 0.75, K, lo))
+    assert set(zip(age[:300].tolist(), env[:300].tolist())) == want and (age[300:] == 7).all() and (env[300:] == 1).all(), (set(zip(age.tolist(), env.tolist())), want)
+    none = rb._before_falls({**buf, "term": jnp.zeros((T, N))}, jax.random.PRNGKey(0), age0, env0, 0.75, K, lo)
+    half = rb._before_falls({**buf, "size": jnp.asarray(4), "ptr": jnp.asarray(4)}, jax.random.PRNGKey(0), age0, env0, 1.0, K)  # rows 0..3 filled only
+    assert (np.asarray(none[0]) == 7).all() and rb._before_falls(buf, None, age0, env0, 0.0, K) == (age0, env0)
+    filled = {(a, e) for a in range(4) for e in range(N) if term[a : a + K, e][: 4 - a].any()}
+    assert filled and set(zip(np.asarray(half[0]).tolist(), np.asarray(half[1]).tolist())) == filled
+    print(f"falls: of 400 starts, the first 300 are redrawn onto the {len(want)} transitions up to {K - 1} steps before a fall (age >= {lo}), all of them hit; "
+          "the rest, and all of them without a fall in the buffer, stay as drawn; a buffer that is not full counts its filled rows only")  # fmt: skip
+
+
+def check_falls(carry, start, args):
+    # sample_starts with the share: every start of the stand-in's buffer then lies within `horizon` steps before a fall
+    xs = tf.build(fall_starts=1.0)
+    st = xs.sample_starts(carry["buf"], jax.random.PRNGKey(2))
+    buf = {k: np.asarray(v) for k, v in carry["buf"].items()}
+    order = (int(buf["ptr"]) - int(buf["size"]) + np.arange(int(buf["size"]))) % buf["term"].shape[0]
+    hits = 0
+    for q in np.asarray(st["s_qpos"]):
+        (a,), (e,) = np.nonzero((buf["s_qpos"][order] == q).all(-1))[:2]
+        hits += bool(buf["term"][order][a : a + xs.cfg.horizon, e].any())
+    plain = np.mean([bool(buf["term"][order][a : a + xs.cfg.horizon, e].any()) for a in range(len(order)) for e in range(tf.N)])
+    assert hits == len(st["s_qpos"]) and 0 < plain < 0.9, (hits, plain)
+    for q in np.asarray(tf.build(fall_starts=1.0, fall_lead=2).sample_starts(carry["buf"], jax.random.PRNGKey(2))["s_qpos"]):
+        (a,), (e,) = np.nonzero((buf["s_qpos"][order] == q).all(-1))[:2]
+        assert buf["term"][order][a : a + 2, e].any()
+
+    # --tilt_term: a second termination per step, on the cosine of the new state's tilt
+    ANGLE, tilt, seen, states, real, wm_step = 0.7, tf.build(tilt_term=0.7), [], [], train.XSoma.termination, train.nets.wm_step
+    with jax.disable_jit(), mock.patch.object(train.XSoma, "termination", lambda self, x: seen.append(x) or real(self, x)), \
+            mock.patch.object(train.nets, "wm_step", lambda *a, **kw: states.append(wm_step(*a, **kw)) or states[-1]):  # fmt: skip
+        tilt.imagine(*args)
+        flat = {**args[3], "s_qpos": args[3]["s_qpos"].at[:, 3:7].set(jnp.asarray([0.0, 1.0, 0.0, 0.0]))}  # upside down
+        assert float(tilt.imagine(*args[:3], flat, *args[4:])[1]["surv"]) == 0.0
+    assert len(seen) >= 2 * tilt.cfg.horizon and all(np.allclose(seen[2 * i + 1][:, 0], states[i][1][:, 2, 2] - np.cos(ANGLE), atol=1e-6) for i in range(tilt.cfg.horizon))
+
+    # --term_penalty: rollouts 0, 2, 4, ... end at their third step
+    W, pen, calls = 5.0, tf.build(term_penalty=5.0), []
+
+    def end(self, clearance):
+        calls.append(0)
+        return jnp.where((len(calls) == 3) & (jnp.arange(clearance.shape[0]) % 2 == 0), 1.0, 0.0)
+
+    with jax.disable_jit(), mock.patch.object(train.XSoma, "termination", end):
+        loss0 = float(tf.build().imagine(*args)[0])
+        del calls[:]
+        loss = float(pen.imagine(*args)[0])
+    want = W * pen.cfg.gamma**2 * 0.5
+    assert np.isclose(loss - loss0, want, rtol=1e-4), (loss, loss0, want)
+    print(f"falls: --fall_starts 1: all {hits} starts lie within {xs.cfg.horizon} steps before a fall (uniform: {plain:.2f} of the buffer); --term_penalty {W}: "
+          f"with half the rollouts ending at step 3 the loss grows by {loss - loss0:.4f} = {W} x gamma^2 x 0.5; --fall_lead 2: within 2 steps; "
+          f"--tilt_term {ANGLE}: a second termination per step on cos(tilt) - cos({ANGLE}), and rollouts that start upside down all end")  # fmt: skip
+
+
 def check_commands(carry, start, args):
     cmd, freq = task.sample_commands(jax.random.PRNGKey(5), 4000)
     cmd_f, freq_f = task.sample_commands(jax.random.PRNGKey(5), 4000, F)
@@ -129,16 +200,17 @@ def check_commands(carry, start, args):
 
     # evaluate.py: the option reaches the simulator and the record
     recs = []
-    for options in ([], ["--cmd_scale", "1", "0.5", "0"]):
+    for options in ([], ["--cmd_scale", "1", "0.5", "0"], ["--push_vel", "0"]):
         seen = []
         with tempfile.TemporaryDirectory() as run, contextlib.redirect_stdout(io.StringIO()), \
-                mock.patch.object(evaluate, "make_sim", lambda n, *a: seen.append(a) or tf.FakeSim(SimCfg(num_envs=n, cmd_scale=a[-1] and tuple(a[-1])))):  # fmt: skip
+                mock.patch.object(evaluate, "make_sim", lambda n, *a, **kw: seen.append(a) or tf.FakeSim(SimCfg(num_envs=n, cmd_scale=a[-1] and tuple(a[-1]), **kw))):  # fmt: skip
             os.makedirs(os.path.join(run, "ckpt"))
             train.save_ckpt(os.path.join(run, "ckpt", "0000"), carry["avg"], carry["pi"], {"it": 2, "train_s": 1.0, "wall_s": 2.0, "env_steps": 3.0})
             evaluate.main([run, "--n", str(tf.N), *options])
             recs.append(json.loads(open(os.path.join(run, "eval.jsonl")).read()))
-        assert seen[0][-1] == (list(F) if options else None)
+        assert seen[0][-1] == (list(F) if "--cmd_scale" in options else None)
     assert "cmd_scale" not in recs[0] and recs[1]["cmd_scale"] == list(F) and set(recs[1]) - set(recs[0]) == {"cmd_scale"}
+    assert recs[2]["push_vel"] == 0 and set(recs[2]) - set(recs[0]) == {"push_vel"}
     print(f"commands: factors {F}: the plain draw times the factors, {stand.mean():.2f} of them stand; train.py passes them and push_vel to its simulator and draws "
           f"imagination's {len(calls)} times with them; evaluate.py --cmd_scale reaches its simulator and the record")  # fmt: skip
 
@@ -147,27 +219,33 @@ def test_step():
     # commands at the start, after robot 2's reset at step 40 and at every resample; pushes
     act = lambda obs: jnp.zeros((tfalls.N, task.J))  # noqa: E731
     with mock.patch.multiple(task, RESAMPLE=10, PUSH_INTERVAL=(0.1, 0.3)):
-        (_, plain), (_, cmds), (_, push) = (tfalls.record(tfalls.FallSim(SimCfg(num_envs=tfalls.N, terrain="plane", **kw)), act, jax.random.PRNGKey(6), 45)
-                                            for kw in ({}, {"cmd_scale": F}, {"push_vel": 2.0}))  # fmt: skip
+        (_, plain), (_, cmds), (_, push), (_, calm) = (tfalls.record(tfalls.FallSim(SimCfg(num_envs=tfalls.N, terrain="plane", **kw)), act, jax.random.PRNGKey(6), 45)
+                                                       for kw in ({}, {"cmd_scale": F}, {"push_vel": 2.0}, {"push_vel": 0.0}))  # fmt: skip
     changes = int((np.abs(np.diff(plain["cmd"], axis=0)).max(-1) > 0).sum())
     assert np.array_equal(cmds["cmd"], plain["cmd"] * np.asarray(F, np.float32)) and plain["end"][:, 2].any() and changes >= 8 and np.abs(plain["cmd"][..., 2]).max() > 0.5
     hit = plain["pushed"]
     assert hit.sum() >= 8 and np.array_equal(push["pushed"], hit) and np.array_equal(cmds["qvel_next"], plain["qvel_next"]) and np.array_equal(push["cmd"], plain["cmd"])
     assert np.array_equal(push["qvel_next"][hit][:, :2], 2 * plain["qvel_next"][hit][:, :2]) and np.array_equal(push["qvel_next"][~hit], plain["qvel_next"][~hit])
     assert 0.5 < np.abs(plain["qvel_next"][hit][:, :2]).max() <= 1.0
+    first = np.argmax(hit.any(1))  # up to the first push the run without pushes is the plain one; at it, its velocity is the physics' own
+    assert not calm["pushed"][1:].any() and np.array_equal(calm["qvel_next"][:first], plain["qvel_next"][:first]) and np.array_equal(calm["qvel_next"][first], calm["qvel"][first])
+    assert evaluate.make_sim(2, 0.5, False, "fast_sac", "plane", push_vel=0.0).cfg.push_vel == 0 and evaluate.make_sim(2, 0.5, False, "fast_sac", "plane").cfg.push_vel == task.PUSH_VEL
     assert evaluate.make_sim(2, 0.5, False, "fast_sac", "plane", 1001, [1.0, 0.5, 0.0]).cfg.cmd_scale == F and evaluate.make_sim(2, 0.5, False, "fast_sac", "plane").cfg.cmd_scale is None
     print(f"step: the real step with cmd_scale {F}: {changes} command changes in 45 steps of 4 robots, each the plain one's times the factors; push_vel 2: "
-          f"{int(hit.sum())} pushes, each twice the plain one's velocity")  # fmt: skip
+          f"{int(hit.sum())} pushes, each twice the plain one's velocity; push_vel 0: none")  # fmt: skip
 
 
 def test_standin():
     with mock.patch.multiple(task, **tf.ROBOT):
-        check_commands(*check_imagine())
+        out = check_imagine()
+        check_falls(*out)
+        check_commands(*out)
 
 
 if __name__ == "__main__":
     assert not os.environ.get("XSOMA_ROBOT_DIR"), "run this test without XSOMA_ROBOT_DIR"
     test_term()
+    test_before_falls()
     test_curb()
     test_standin()
     test_step()

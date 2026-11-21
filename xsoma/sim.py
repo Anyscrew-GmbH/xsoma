@@ -56,7 +56,7 @@ class SimCfg:
     random_start: bool = False  # PPO's init_at_random_ep_len: initial episode counters uniform in [0, 1000)
     max_episode: int = task.MAX_EPISODE  # time-out once the episode counter exceeds it (evaluate.py --steps runs longer episodes)
     cmd_scale: tuple | None = None  # three factors on the command ranges of vx, vy and wz (task.sample_commands); None: Holosoma's
-    push_vel: float = task.PUSH_VEL  # a push sets the root's world (vx, vy) to U[-push_vel, push_vel] each
+    push_vel: float = task.PUSH_VEL  # a push sets the root's world (vx, vy) to U[-push_vel, push_vel] each; 0: no pushes
     nconmax: int = 96  # contacts per world (the size of Holosoma's MuJoCo Warp contact pool)
     njmax: int = 576  # constraint rows per world (Holosoma: max(6 x 96, 4 nv))
     naccdmax: int = 0  # heightfield (CCD) contacts per world; 0: nconmax
@@ -495,7 +495,7 @@ class Sim:
 
         # pushes
         push_t = s1.push_t + 1
-        push = push_t == s1.push_at
+        push = (push_t == s1.push_at) & (self.cfg.push_vel > 0)  # push_vel 0: no pushes (a zeroed velocity would be one)
         qvel = s1.data.qvel
         vxy = self.cfg.push_vel * jax.random.uniform(k_push, (N, 2), minval=-1.0, maxval=1.0)
         qvel = qvel.at[:, :2].set(jnp.where(push[:, None], vxy, qvel[:, :2]))

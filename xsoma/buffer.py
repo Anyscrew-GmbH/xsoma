@@ -93,25 +93,44 @@ def sample_windows(buf, key, B: int, k: int):
     return w
 
 
-def sample_starts(buf, key, B: int):
+def _before_falls(buf, key, age, env, share: float, K: int, lo: int = 0):
+    """`age`, `env` with the first `share` of them redrawn, uniformly, from the transitions of age >= lo whose env falls
+    (`term`) at that step or in the K - 1 after it. While the buffer holds no such transition they stay as drawn."""
+    T, n = _T(buf), int(round(share * age.shape[0]))
+    if n == 0:
+        return age, env
+    term = jnp.roll(buf["term"], -_rows(buf, 0), 0) * (jnp.arange(T) < buf["size"])[:, None]  # row = age
+    c = jnp.concatenate((jnp.zeros_like(term[:1]), jnp.cumsum(term, 0)))
+    near = (c[jnp.minimum(jnp.arange(T) + K, T)] > c[:-1]) & (jnp.arange(T) >= lo)[:, None]  # (age, env): a fall within K steps
+    cdf = jnp.cumsum(near.reshape(-1))
+    i = jnp.searchsorted(cdf, jax.random.randint(key, (n,), 0, jnp.maximum(cdf[-1], 1)), side="right")
+    on = (jnp.arange(age.shape[0]) < n) & (cdf[-1] > 0)
+    pad = jnp.zeros((age.shape[0] - n,), i.dtype)
+    return jnp.where(on, jnp.concatenate((i // term.shape[1], pad)), age), jnp.where(on, jnp.concatenate((i % term.shape[1], pad)), env)
+
+
+def sample_starts(buf, key, B: int, fall_share: float = 0.0, K: int = 0):
     """B starting states for imagination, uniform over the finite transitions: 2B random transitions are drawn and the first B
-    finite ones kept (a way to skip non-finite ones with fixed array shapes)."""
+    finite ones kept (a way to skip non-finite ones with fixed array shapes). `fall_share` of the 2B are drawn from the K steps
+    before a fall instead (`_before_falls`), and come first, so about that share of the B is of this kind."""
     ka, ke = jax.random.split(key)
     N = buf["s_qpos"].shape[1]
     age = _uniform_int(ka, buf["size"], 2 * B)
     env = jax.random.randint(ke, (2 * B,), 0, N)
+    age, env = _before_falls(buf, jax.random.fold_in(key, 2), age, env, fall_share / 2, K)
     s = gather(buf, _rows(buf, age), env)
     idx = jnp.argsort(1 - s["ok"], stable=True)[:B]
     return jax.tree.map(lambda x: x[idx], s)
 
 
-def sample_histories(buf, key, B: int, H: int):
+def sample_histories(buf, key, B: int, H: int, fall_share: float = 0.0, K: int = 0):
     """As `sample_starts`, each start with the H - 1 transitions of its env before it: (B, H, ...), the start last. The starts
     are uniform over the finite transitions that have H - 1 older ones in the buffer."""
     ka, ke = jax.random.split(key)
     N = buf["s_qpos"].shape[1]
     age = H - 1 + _uniform_int(ka, buf["size"] - (H - 1), 2 * B)
     env = jax.random.randint(ke, (2 * B,), 0, N)
+    age, env = _before_falls(buf, jax.random.fold_in(key, 2), age, env, fall_share / 2, K, H - 1)
     w = gather(buf, _rows(buf, age[:, None] + jnp.arange(1 - H, 1)), env[:, None])
     idx = jnp.argsort(1 - w["ok"][:, -1], stable=True)[:B]
     return jax.tree.map(lambda x: x[idx], w)

@@ -25,7 +25,8 @@ Holosoma: hs/**/model_*.npz), each with its wall-clock time since the run's laun
 fixed at 0.8. train.py calls this module after training.
 
 `--steps` sets the episode's length (the time-out) in policy steps; a record then names it (`episode`). `--cmd_scale x y z`
-scales the command ranges of vx, vy and wz; a record then names the factors (`cmd_scale`). `--falls` and
+scales the command ranges of vx, vy and wz; a record then names the factors (`cmd_scale`). `--push_vel` sets the size of the
+pushes (0: none); a record then names it (`push_vel`). `--falls` and
 `--episodes` write JSON lines that tell when and why robots fall (both files start empty; every line names its checkpoint; a
 step is numbered by the episode counter after it, as `len` is, and lasts task.DT):
   --episodes  one line per env: `fall` (the step of the fall, -1 without one), the tile it started on (`tile` row and column,
@@ -284,12 +285,12 @@ def load_policy(path, which="avg"):
     return [{k.split("/")[2]: jnp.asarray(z[k]) for k in z.files if k.startswith(f"{which}/{i}/")} for i in range(n)]
 
 
-def make_sim(n=2048, scale=0.5, sole_friction=False, preset="fast_sac", terrain="mix", steps=task.MAX_EPISODE + 1, cmd_scale=None):
+def make_sim(n=2048, scale=0.5, sole_friction=False, preset="fast_sac", terrain="mix", steps=task.MAX_EPISODE + 1, cmd_scale=None, push_vel=task.PUSH_VEL):
     """The evaluation simulator; the defaults are the setting that Holosoma's MuJoCo Warp baselines train in (terrain scale 0.5,
     sole friction fixed at 0.8). `steps`: the policy steps of an episode that does not end in a fall. `cmd_scale`: three
-    factors on the command ranges of vx, vy and wz."""
+    factors on the command ranges of vx, vy and wz. `push_vel`: the size of the pushes (m/s), 0 for none."""
     return Sim(SimCfg(num_envs=n, terrain=terrain, terrain_scale=scale, preset=preset, sole_friction=sole_friction, random_start=False,
-                      max_episode=steps - 1, cmd_scale=cmd_scale and tuple(cmd_scale)))  # fmt: skip
+                      max_episode=steps - 1, cmd_scale=cmd_scale and tuple(cmd_scale), push_vel=push_vel))  # fmt: skip
 
 
 def run_all(sim: Sim, jobs, seed=1, which="avg", out=None, tracker_meta=None, tracker_heading=None, falls=None, episodes=None):
@@ -323,7 +324,7 @@ def run_all(sim: Sim, jobs, seed=1, which="avg", out=None, tracker_meta=None, tr
                "sole_sink_max": float(sink.mean()), "sole_sink_frac": float(deep.mean()), "sole_sink_p99": float(p99),
                **({"legs_overlap": float(legs[0].mean()), "legs_dist": float(legs[1].mean())} if legs else {}),
                **({"tracker_heading": heading} if heading else {}), **({"episode": T + 1} if T != task.MAX_EPISODE else {}),
-               **({"cmd_scale": list(sim.cfg.cmd_scale)} if sim.cfg.cmd_scale else {}),
+               **({"cmd_scale": list(sim.cfg.cmd_scale)} if sim.cfg.cmd_scale else {}), **({"push_vel": sim.cfg.push_vel} if sim.cfg.push_vel != task.PUSH_VEL else {}),
                **{f"rew_{k}": float(v) for k, v in zip(task.TERMS, rew)}}  # fmt: skip
         if run and out:
             with open(os.path.join(run, out + ".jsonl"), "a") as f:
@@ -347,10 +348,11 @@ def main(argv=None):
                    help="tracker checkpoints: the heading mode (train.py); default: the one in the run directory's config.json, else hold")  # fmt: skip
     p.add_argument("--steps", type=int, default=task.MAX_EPISODE + 1, help="policy steps of an episode (the time-out); 50 per second")
     p.add_argument("--cmd_scale", type=float, nargs=3, default=None, help="factors on the command ranges of vx, vy and wz (default: U[-1, 1] each)")
+    p.add_argument("--push_vel", type=float, default=task.PUSH_VEL, help="size of the pushes in m/s; 0: no pushes")
     p.add_argument("--falls", default=None, help="write every fall with its last 2 s to this JSON-lines file")
     p.add_argument("--episodes", default=None, help="write a summary of every episode to this JSON-lines file")
     a = p.parse_args(argv)
-    sim = make_sim(a.n, a.scale, bool(a.sole_friction), a.preset, a.terrain, a.steps, a.cmd_scale)
+    sim = make_sim(a.n, a.scale, bool(a.sole_friction), a.preset, a.terrain, a.steps, a.cmd_scale, push_vel=a.push_vel)
     for name in (a.falls, a.episodes):
         if name:
             open(name, "w").close()
