@@ -160,6 +160,12 @@ class Config:
     torque_limit: float = 0.0  # weight of the penalty task.torque_limit on the PD torque that the imagined action asks for beyond
     #                            torque_soft x the effort limit, in imagination's reward only and weighted as feet_cross is (0: not computed)
     torque_soft: float = 0.9  # with torque_limit: the share of the effort limit from which on the torque is penalized
+    support: float = 0.0  # share of the episodes that start with the robot on a rope that pulls its torso up (sim.Sim._support,
+    #                       task.support_force): at rest in the default pose, the policy acting from the start, no command while on
+    #                       the rope, which is paid out after a random hold and then taken off. The rope's top and pay-out speed are
+    #                       the last two entries of the dynamics context; imagination pays the rope out as the simulator does (0: off)
+    support_gap: str = "-0.02,0.05"  # with support: the range (m) of the lowest sole point's height over the terrain while hanging
+    #                                  (negative: on the terrain, the rope carrying part of the weight or slack)
     # runtime
     imag_unroll: int = 4  # unrolling of the imagination loop (speed saturates at 4; compile time grows with it)
     imag_remat: str = "none"  # rematerialization of the imagination steps: none | dots | full (less memory, slower)
@@ -216,7 +222,8 @@ class XSoma:
         set_jax(c.jax_cache)
         self.sim = Sim(SimCfg(num_envs=c.num_envs, terrain=c.terrain, terrain_scale=c.terrain_scale, foot=c.foot, preset=c.preset,
                               sole_friction=bool(c.sole_friction), random_start=bool(c.random_start), seed=42 + c.seed,
-                              cmd_scale=self.cmd_scale, push_vel=c.push_vel))  # fmt: skip
+                              cmd_scale=self.cmd_scale, push_vel=c.push_vel, support=c.support,
+                              support_gap=tuple(float(x) for x in c.support_gap.split(","))))  # fmt: skip
         if c.foot_clearance:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
             self.sole_foot = np.asarray(self.sim.sole_frame) == np.arange(2, 4)[:, None]
         self.ext = None  # --ext_joints: (the joints' indices, their lowest and their highest goal in rad)
@@ -426,6 +433,9 @@ class XSoma:
             start = rb.nest(rb.sample_starts(buf, k_s, B, c.fall_starts, c.fall_lead or c.horizon))
         cmd, freq = task.sample_commands(k_c, B, self.cmd_scale)
         fresh = jax.random.uniform(k_u, (B,)) < c.cmd_fresh
+        if c.support:  # no command on the rope, as in the simulator
+            on = start["xi"][:, -2] > task.SUPPORT_OFF
+            cmd, fresh = jnp.where(on[:, None], 0.0, cmd), fresh | on
         start["cmd"] = jnp.where(fresh[:, None], cmd, start["cmd"])
         start["freq"] = jnp.where(fresh, freq, start["freq"])
         start["phase"] = jnp.where(fresh[:, None], task.gait_phase(start["t"], start["freq"], start["offset"], start["cmd"]), start["phase"])
@@ -457,7 +467,7 @@ class XSoma:
         bf16 = c.mm_bf16 in ("imag", "all")
         rcfg = self.reward_cfg
         S0 = unflatten(start["s_qpos"], start["s_qvel"])
-        xi, delay, offset = start["xi"], start["delay"], start["offset"]
+        delay, offset = start["delay"], start["offset"]
         if c.init_tracker:
             pi = {**self.frozen, **pi}
 
@@ -470,7 +480,7 @@ class XSoma:
             ext = (x, jax.random.uniform(k_g, x.shape, minval=lo, maxval=hi), task.EXT_SPEED * jax.random.uniform(k_s, x.shape), start.get("ext_own", 0 * x))
 
         def step(carry, k):
-            S, v, a_last, cmd, freq, phase, t, mem, ext = carry
+            S, v, a_last, cmd, freq, phase, t, mem, ext, xi = carry
             k_o, k_c = jax.random.split(k)
             pen = None
             if c.init_tracker:
@@ -528,14 +538,18 @@ class XSoma:
             cmd2, freq2 = task.sample_commands(k_c, B, self.cmd_scale)
             new = t1 % task.RESAMPLE == 0
             cmd1, freq1 = jnp.where(new[:, None], cmd2, cmd), jnp.where(new, freq2, freq)
-            return (S1, v1, a, cmd1, freq1, phase1, t1, mem, ext), (r, d, pen)
+            if c.support:  # the rope is paid out as in the simulator, and a robot on it gets no new command
+                top, rate = task.support_pay_out(xi[:, -2], xi[:, -1])
+                xi = jnp.concatenate((xi[:, :-2], top[:, None], rate[:, None]), -1)
+                cmd1 = jnp.where((top > task.SUPPORT_OFF)[:, None], 0.0, cmd1)
+            return (S1, v1, a, cmd1, freq1, phase1, t1, mem, ext, xi), (r, d, pen)
 
         if c.imag_remat == "dots":
             step = jax.checkpoint(step, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         elif c.imag_remat == "full":
             step = jax.checkpoint(step)
         mem = (start["hist"][:, :-1], start["heading"]) if c.init_tracker else None
-        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext)
+        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext, start["xi"])
         _, (r, d, pen) = jax.lax.scan(step, init, keys, unroll=c.imag_unroll)
         alive = jnp.cumprod(1 - d, 0)
         alive_before = jnp.concatenate((jnp.ones_like(alive[:1]), alive[:-1]), 0)  # a step's reward counts if alive before it
@@ -664,6 +678,8 @@ def main(argv=None):
     assert min(cfg.track_l1, cfg.stand_still) >= 0 and (not cfg.ext_blind or (cfg.ext_joints and cfg.init_tracker)), "--track_l1 is not negative, --ext_blind needs --ext_joints and --init_tracker"
     assert cfg.track_rel >= 0 and (cfg.track_l1 or not cfg.track_rel), "--track_rel is not negative and needs --track_l1"
     assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
+    gap = [float(x) for x in cfg.support_gap.split(",")]
+    assert 0 <= cfg.support <= 1 and len(gap) == 2 and gap[0] <= gap[1], "--support is a share, --support_gap is lo,hi in m"
     assert 0 <= cfg.ext_share <= 1 and (cfg.layout == "1GPU" or not cfg.ext_joints), "--ext_share is a share, --ext_joints needs --layout 1GPU"
     assert task.SELF_COLLISION or cfg.self_clearance == cfg.self_clearance_term == 0, "--self_clearance and --self_clearance_term need robot.json's self_collision"
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]
@@ -705,7 +721,7 @@ def main(argv=None):
         rew = np.sum([x["rew_sums"] for x in cs], 0) / n_done
         stats = {"ep_len": sum(float(x["len_sum"]) for x in cs) / n_done, "done": n_done,
                  "contact": sum(float(x["terminated"]) for x in cs) / n_done, **{f"rew_{k}": float(v) for k, v in zip(task.TERMS, rew)},
-                 **{k: float(np.mean([x[k] for x in cs])) for k in ("reward", "scale", "avg_len", "term_geom", "nacon", "nonfinite_env")},
+                 **{k: float(np.mean([x[k] for x in cs])) for k in ("reward", "scale", "avg_len", "term_geom", "nacon", "nonfinite_env") + (("support",) if cfg.support else ())},
                  "diverged": sum(float(x["diverged"]) for x in cs),
                  **{k: float(np.mean([x[k] for x in ls])) for k in ls[0]}, **{k: float(v) for k, v in ev.items()}}  # fmt: skip
         train_s = time.time() - t0
@@ -724,7 +740,8 @@ def main(argv=None):
               f"{(env_steps - prev_env) / max(train_s - prev_s, 1e-9) / 1e3:.0f}k steps/s"
               + (f" | h_err {stats['h_err8'] * 100:.1f}/{stats['h_errK'] * 100:.1f} cm term env {stats['term_env']:.3f} wm {stats['term_wm']:.3f}" if cfg.wm_eval else "")
               + (f" | gated wm {stats['wm_gated']:.2f} gn {stats['gn_gated']:.2f}" if stats["wm_gated"] or stats["gn_gated"] else "")
-              + (f" | diverged {stats['diverged']:.0f}" if stats["diverged"] else ""),
+              + (f" | diverged {stats['diverged']:.0f}" if stats["diverged"] else "")
+              + (f" | on rope {stats['support']:.3f}" if cfg.support else ""),
               flush=True)  # fmt: skip
         prev_s, prev_env = train_s, env_steps
         # a checkpoint every ckpt_minutes, and a last one when training ends

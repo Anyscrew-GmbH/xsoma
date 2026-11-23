@@ -375,6 +375,28 @@ MAX_DELAY = 1  # action delay in policy steps, U{0, 1} per env at every reset
 PUSH_INTERVAL = (5.0, 10.0)  # s between pushes, per env; a push overwrites the root's world (vx, vy) with U[-1, 1] each
 PUSH_VEL = 1.0
 
+# A rope that holds the robot up by its torso at the start of an episode (sim.SimCfg.support, train.py --support; not Holosoma's):
+# it pulls straight up on the torso body, taut while the pelvis is below the rope's top; after a hold it is paid out, then taken off
+SUPPORT_K, SUPPORT_C = 5e4, 1e3  # the rope's stiffness (N/m) and damping (N s/m)
+SUPPORT_HOLD = (0.0, 8.0)  # s, U per episode: the hold before the pay-out
+SUPPORT_SPEED = 0.05  # m/s: the pay-out
+SUPPORT_SLACK = 0.05  # m: the rope is taken off once its top is this far below the standing height
+SUPPORT_OFF = -1.0  # the top (relative to the standing height) of an env without a rope
+
+
+def support_force(top, h, vz):
+    """The rope's tension (N), never negative: K (top - h) - C vz while the pelvis height h is below the top (both in m, in one
+    frame), zero above; vz is the pelvis' vertical velocity (m/s)."""
+    return jnp.where(h < top, jnp.maximum(0.0, SUPPORT_K * (top - h) - SUPPORT_C * vz), 0.0)
+
+
+def support_pay_out(top, rate):
+    """One policy step of the rope: its top (m, relative to the standing height) lowered by rate (m/s) x DT, and once it is
+    SUPPORT_SLACK below the standing height the rope taken off (top SUPPORT_OFF, rate 0). Returns (top, rate)."""
+    top = top - rate * DT
+    off = top < -SUPPORT_SLACK
+    return jnp.where(off, SUPPORT_OFF, top), jnp.where(off, 0.0, rate)
+
 
 def _payload(entries):
     """robot.json's optional `payload` (the G1 has none) -> the bodies' names and, per body, the ranges (lo, hi) of its mass (kg)

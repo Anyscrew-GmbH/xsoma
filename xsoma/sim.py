@@ -57,6 +57,10 @@ class SimCfg:
     max_episode: int = task.MAX_EPISODE  # time-out once the episode counter exceeds it (evaluate.py --steps runs longer episodes)
     cmd_scale: tuple | None = None  # three factors on the command ranges of vx, vy and wz (task.sample_commands); None: Holosoma's
     push_vel: float = task.PUSH_VEL  # a push sets the root's world (vx, vy) to U[-push_vel, push_vel] each; 0: no pushes
+    support: float = 0.0  # share of the episodes that start on a rope (task.support_force; not Holosoma's), see Sim._support; 0: none
+    support_gap: tuple = (-0.02, 0.05)  # m, U per such episode: the lowest sole point over the terrain while the rope holds the
+    #                                     nominal robot in the default pose; negative: on the terrain, the rope carrying part of the
+    #                                     weight (from minus the rope's stretch under the weight on, none: slack)
     nconmax: int = 96  # contacts per world (the size of Holosoma's MuJoCo Warp contact pool)
     njmax: int = 576  # constraint rows per world (Holosoma: max(6 x 96, 4 nv))
     naccdmax: int = 0  # heightfield (CCD) contacts per world; 0: nconmax
@@ -113,6 +117,8 @@ class State(NamedTuple):
     avg_len: jax.Array  # () average episode length of the curriculum
     ep_sums: jax.Array  # (N, len(task.TERMS)) running episode sums of the weighted reward terms
     key: jax.Array  # random key, split anew in every step
+    sup: jax.Array = None  # (N,) with SimCfg.support: the rope's top relative to the standing height (m), task.SUPPORT_OFF: no rope
+    sup_wait: jax.Array = None  # (N,) with SimCfg.support: steps until the rope is paid out
 
 
 class Transition(NamedTuple):
@@ -278,8 +284,13 @@ class Sim:
         self.coll_local, self.coll_frame, self.coll_radius = _points(m, tg, frames, bottom=False)
         self.sole_local, self.sole_frame, self.sole_radius = _points(m, sole_geoms, frames, bottom=True)
         self.kin = Kinematics(m, [m.body(b).name for b in frames])
-        y = np.asarray(self.kin.forward(jnp.zeros(3), jnp.eye(3), jnp.asarray(task.DEFAULT_Q))[0])[2:4, 1]  # the feet in the default pose
+        P, Rs = self.kin.forward(jnp.zeros(3), jnp.eye(3), jnp.asarray(task.DEFAULT_Q))  # the default pose, pelvis at the origin
+        y = np.asarray(P)[2:4, 1]
         assert y[0] > y[1], "task.FEET must name the left foot first (task.feet_dy)"
+        # the standing height (the pelvis over the lowest sole point in the default pose) and the rope's stretch under the
+        # nominal weight (SimCfg.support)
+        self.stand_h = float(-(np.asarray(P[self.sole_frame] + mv3(Rs[self.sole_frame], self.sole_local))[:, 2] - self.sole_radius).min())
+        self.hang = float(m.body_mass.sum() * 9.81 / task.SUPPORT_K)
         if task.SELF_COLLISION is not None:  # the two groups' colliders are the geoms with scene.py's contact bit 4
             self.self_distance = SelfDistance(m, np.flatnonzero(m.geom_contype & 4), np.flatnonzero(m.geom_conaffinity & 4))
         self.mass_ids = np.asarray([m.body(f"robot_{b}").id for b in task.MASS_BODIES])
@@ -354,10 +365,16 @@ class Sim:
         m, w, t, p = self.m, s.world, self.torso, self.payload
         xi = jnp.concatenate((s.kp, s.kd, w.body_mass[:, self.mass_ids] / m.body_mass[self.mass_ids], (w.body_mass[:, t] - m.body_mass[t])[:, None],
                               w.body_ipos[:, t] - m.body_ipos[t], w.geom_friction[:, 0, :1]), -1)  # fmt: skip
-        if not len(p):
-            return xi
-        pay = jnp.concatenate(((w.body_mass[:, p] - m.body_mass[p])[..., None], w.body_ipos[:, p] - m.body_ipos[p]), -1)
-        return jnp.concatenate((xi, pay.reshape(len(pay), -1)), -1)
+        if len(p):
+            pay = jnp.concatenate(((w.body_mass[:, p] - m.body_mass[p])[..., None], w.body_ipos[:, p] - m.body_ipos[p]), -1)
+            xi = jnp.concatenate((xi, pay.reshape(len(pay), -1)), -1)
+        if self.cfg.support:  # the rope's top and the speed at which it is paid out: the last 2 (imagination pays it out too)
+            xi = jnp.concatenate((xi, s.sup[:, None], self._rate(s)[:, None]), -1)
+        return xi
+
+    def _rate(self, s: State):
+        """(N,) the speed (m/s) at which each env's rope is being paid out: zero without a rope and while it holds."""
+        return jnp.where((s.sup > task.SUPPORT_OFF) & (s.sup_wait <= 0), task.SUPPORT_SPEED, 0.0)
 
     def init(self, key) -> State:
         """Reset every env, then take one zero-action step, as Holosoma does at start-up (the curriculum updates in both)."""
@@ -370,6 +387,8 @@ class Sim:
         s = State(data, world, jnp.zeros((N, task.ACTOR_DIM)), jnp.zeros((N, task.CRITIC_DIM)), jnp.zeros((N, J)), jnp.ones((N, J)),
                   jnp.ones((N, J)), zi, jnp.zeros((N, 3)), zf, jnp.zeros((N, 2)), jnp.zeros((N, 2)), zi, zi, zi,
                   jnp.asarray(c0.initial, jnp.float32), jnp.zeros((), jnp.float32), jnp.zeros((N, len(task.TERMS))), key)  # fmt: skip
+        if self.cfg.support:
+            s = s._replace(sup=jnp.full((N,), task.SUPPORT_OFF, jnp.float32), sup_wait=zi)
         s = self._reset(s, jnp.ones((N,), bool), k_reset)
         # the penalty curriculum updates once here, as in Holosoma's reset_all, and once more in the step
         scale, avg_len = task.curriculum_step(self.curriculum_cfg, s.scale, s.avg_len, jnp.zeros((N,)), jnp.zeros((N,), bool), N)
@@ -379,18 +398,22 @@ class Sim:
         return s
 
     # ------------------------------------------------------------------ one policy step
-    def physics(self, world: World, data, target, kp, kd):
+    def physics(self, world: World, data, target, kp, kd, top=None):
         """Advance every world by one policy step: DECIMATION physics substeps, with the PD torques recomputed from the current
-        joint state before each one (spec 1.5)."""
+        joint state before each one (spec 1.5). `top` (N,), with SimCfg.support: the world height of each env's rope top; the
+        rope's tension (task.support_force of the pelvis height) pulls the torso up, recomputed before each substep too."""
         mx = world.model.tree_replace({k: getattr(world, k) for k in WORLD_FIELDS})
 
-        def one(m_, d, tg, kp_, kd_):
+        def one(m_, d, tg, kp_, kd_, top_):
             def substep(_, dd):
-                return mjx.step(m_, dd.replace(ctrl=task.torques(dd.qpos[7:], dd.qvel[6:], tg, kp_, kd_)))
+                dd = dd.replace(ctrl=task.torques(dd.qpos[7:], dd.qvel[6:], tg, kp_, kd_))
+                if top_ is not None:
+                    dd = dd.replace(xfrc_applied=dd.xfrc_applied.at[self.torso, 2].set(task.support_force(top_, dd.qpos[2], dd.qvel[2])))
+                return mjx.step(m_, dd)
 
             return jax.lax.fori_loop(0, task.DECIMATION, substep, d)
 
-        return jax.vmap(one, in_axes=(self.axes, 0, 0, 0, 0))(mx, data, target, kp, kd)
+        return jax.vmap(one, in_axes=(self.axes, 0, 0, 0, 0, None if top is None else 0))(mx, data, target, kp, kd, top)
 
     def contact_termination(self, data):
         """Net contact force above 1 N on a termination body after the last substep."""
@@ -443,6 +466,9 @@ class Sim:
         """Replace the state of the envs where `done` is set by freshly drawn values."""
         qpos, qvel, kp, kd, delay, cmd, freq, offset, push_at = self._fresh(key, s.world.origin)
         on, on2 = done[:, None], done  # the reset mask, shaped for fields with a trailing axis and for per-env scalars
+        if self.cfg.support:
+            qpos, qvel, cmd, sup, wait = self._support(jax.random.fold_in(key, 3), qpos, qvel, cmd, s.world.heights)
+            s = s._replace(sup=jnp.where(on2, sup, s.sup), sup_wait=jnp.where(on2, wait, s.sup_wait))
         d = s.data
         # the solver's warm start (the previous acceleration) belongs to the old state, so it is cleared too
         d = d.replace(qpos=jnp.where(on, qpos, d.qpos), qvel=jnp.where(on, qvel, d.qvel), qacc_warmstart=jnp.where(on, 0.0, d.qacc_warmstart))
@@ -451,6 +477,21 @@ class Sim:
                           offset=jnp.where(on, offset, s.offset), t=jnp.where(on2, 0, s.t), push_t=jnp.where(on2, 0, s.push_t),
                           push_at=jnp.where(on2, push_at, s.push_at), ep_sums=jnp.where(on, 0.0, s.ep_sums))  # fmt: skip
 
+    def _support(self, key, qpos, qvel, cmd, heights):
+        """SimCfg.support for fresh envs: a share of them starts on the rope, at rest and upright in the default pose with the
+        lowest sole point support_gap over the terrain under the pelvis (on it for a negative gap), and without a command (an
+        operator gives none while the robot hangs); the rope's top is where it holds the nominal robot at that gap, and it is
+        paid out after a hold of task.SUPPORT_HOLD. Returns qpos, qvel, cmd, the rope's top and the steps until the pay-out."""
+        N, (lo, hi) = self.N, self.cfg.support_gap
+        k_on, k_gap, k_hold = jax.random.split(key, 3)
+        on = (jax.random.uniform(k_on, (N,)) < self.cfg.support)[:, None]
+        gap = jax.random.uniform(k_gap, (N,), minval=lo, maxval=hi)
+        z = self.height(heights, qpos[:, 0], qpos[:, 1]) + self.stand_h + jnp.maximum(gap, 0.0)
+        pose = jnp.concatenate((qpos[:, :2], z[:, None], qpos[:, 3:7], jnp.broadcast_to(jnp.asarray(task.DEFAULT_Q), (N, task.J))), -1)
+        hold = jax.random.uniform(k_hold, (N,), minval=task.SUPPORT_HOLD[0], maxval=task.SUPPORT_HOLD[1])
+        return (jnp.where(on, pose, qpos), jnp.where(on, 0.0, qvel), jnp.where(on, 0.0, cmd), jnp.where(on[:, 0], gap + self.hang, task.SUPPORT_OFF),
+                (hold / task.DT).astype(jnp.int32))  # fmt: skip
+
     def step(self, s: State, action) -> tuple[State, Transition]:
         """One policy step of all envs, in the order of the module docstring. Returns the next state, with the observations
         for the next action, and the step's Transition."""
@@ -458,7 +499,10 @@ class Sim:
         key, k_reset, k_cmd, k_push, k_push_at, k_obs = jax.random.split(s.key, 6)
         a = action.astype(jnp.float32)
         target = jnp.clip(jnp.where(s.delay[:, None] == 0, a, s.a_last), -task.ACTION_CLIP, task.ACTION_CLIP)
-        data = self.physics(s.world, s.data, target, s.kp, s.kd)
+        rope = {}
+        if self.cfg.support:  # the rope's top in world height, over the terrain under the pelvis
+            rope["top"] = self.height(s.world.heights, s.data.qpos[:, 0], s.data.qpos[:, 1]) + self.stand_h + s.sup
+        data = self.physics(s.world, s.data, target, s.kp, s.kd, **rope)
         s1_qpos, s1_qvel = data.qpos, data.qvel
         t = s.t + 1
         v = self.view(s1_qpos, s1_qvel, s.world.heights)
@@ -482,6 +526,8 @@ class Sim:
                  "term_geom": (((clearance.min(-1) < 0) == terminated) | diverged).mean(), "diverged": diverged.sum().astype(jnp.float32),
                  "nacon": data._impl.nacon[0] / data._impl.contact__dist.shape[0]}  # fmt: skip
         s1 = s._replace(data=data, a_last=a, t=t, ep_sums=ep_sums)
+        if self.cfg.support:  # the rope is paid out after its hold, then taken off
+            s1 = s1._replace(sup=task.support_pay_out(s.sup, self._rate(s))[0], sup_wait=s.sup_wait - 1)
 
         # resets and the curriculum
         scale, avg_len = task.curriculum_step(self.curriculum_cfg, s.scale, s.avg_len, t.astype(jnp.float32), done, N)
@@ -492,6 +538,9 @@ class Sim:
         resample = s1.t % task.RESAMPLE == 0
         cmd2, freq2 = task.sample_commands(k_cmd, N, self.cfg.cmd_scale)
         cmd, freq = jnp.where(resample[:, None], cmd2, s1.cmd), jnp.where(resample, freq2, s1.freq)
+        if self.cfg.support:  # no command on the rope
+            cmd = jnp.where((s1.sup > task.SUPPORT_OFF)[:, None], 0.0, cmd)
+            stats["support"] = (s1.sup > task.SUPPORT_OFF).mean()
 
         # pushes
         push_t = s1.push_t + 1
