@@ -26,6 +26,13 @@ imagination's reward on a foot that moves horizontally lower than `--foot_cleara
 scales the command ranges of vx, vy and wz, and `--push_vel` sets the size of the pushes in collection (0: none).
 `--term_penalty` charges an imagined fall a fixed amount, `--fall_starts` starts a share of the imagined rollouts shortly
 before a real fall (`--fall_lead` steps at most), and `--tilt_term <rad>` ends an imagined rollout at that tilt of the base already.
+`--ext_joints name:lo:hi,...` hands joints to something else than the policy while the command is zero: in a share `--ext_share`
+of the commands their targets follow random goals (task.ext_step), in collection and in imagination, and imagination's pose and
+action-rate penalties leave them out. `--stand_still` weighs a penalty on any motion of the base and the feet under a zero
+command (task.stand_still), in imagination only. A fourth entry of `--cmd_scale` is the share of zero commands. With
+`--ext_blind 1` a tracker policy is not shown those joints while they are driven from outside (`XSoma.hide`). `--track_l1`
+weighs a penalty on the plain distance between the command and the base's velocity (task.track_l1), in imagination only;
+`--track_rel` takes that distance relative to the command's size.
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -40,6 +47,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -67,7 +75,8 @@ class Config:
     random_start: int = 1  # episode counters start uniform in [0, 1000), so episodes end at different times (as Holosoma's PPO)
     cmd_scale: str = ""  # "x,y,z": factors on the command ranges of vx, vy and wz, in collection and in imagination, e.g.
     #                      "1,0.5,1" for sideways commands up to 0.5 m/s ("": Holosoma's U[-1, 1]); the evaluation after training
-    #                      keeps Holosoma's ranges (evaluate.py --cmd_scale)
+    #                      keeps Holosoma's ranges (evaluate.py --cmd_scale). "x,y,z,p": p is the share of zero commands (Holosoma's 0.2);
+    #                      "x,y,z,p,q": each component of a command is also zero with probability q
     push_vel: float = task.PUSH_VEL  # m/s: a push in collection sets the root's (vx, vy) to U[-push_vel, push_vel] each (0: none); the
     #                                  evaluation keeps Holosoma's pushes
     # schedule
@@ -133,6 +142,20 @@ class Config:
     #                              sole point is less than foot_clearance_height over the terrain, in imagination's reward only
     #                              and weighted as feet_cross is (0: not computed); it needs no gait clock
     foot_clearance_height: float = task.FOOT_CLEARANCE_HEIGHT  # m
+    ext_joints: str = ""  # "name:lo:hi,...": every joint whose name contains `name` is driven by something else than the policy
+    #                       while the command is zero, in a share `ext_share` of the commands: its target moves between random
+    #                       goals in [lo, hi] rad (task.ext_step), starting from the policy's own target. The policy sees those
+    #                       targets as its previous action. "": the policy drives every joint
+    ext_share: float = 0.5  # with ext_joints: drawn per env with every command
+    ext_blind: int = 0  # with ext_joints and init_tracker, 1: while those joints are driven from outside the policy is fed their
+    #                     default pose, zero velocity and its own last action for them, as a runtime that hides them does
+    track_l1: float = 0.0  # weight of the penalty task.track_l1, the distance between the command and the base's planar velocity
+    #                        and yaw rate without the tracking rewards' tolerance, in imagination's reward only and weighted as
+    #                        feet_cross is (0: not computed)
+    track_rel: float = 0.0  # with track_l1: the error is divided by the size of the command (the norm of its three components,
+    #                         at least this; not for a zero command), so that slow commands weigh as much as fast ones (0: off)
+    stand_still: float = 0.0  # weight of the penalty task.stand_still on the base and the feet moving under a zero command, in
+    #                           imagination's reward only and weighted as feet_cross is (0: not computed)
     # runtime
     imag_unroll: int = 4  # unrolling of the imagination loop (speed saturates at 4; compile time grows with it)
     imag_remat: str = "none"  # rematerialization of the imagination steps: none | dots | full (less memory, slower)
@@ -192,6 +215,12 @@ class XSoma:
                               cmd_scale=self.cmd_scale, push_vel=c.push_vel))  # fmt: skip
         if c.foot_clearance:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
             self.sole_foot = np.asarray(self.sim.sole_frame) == np.arange(2, 4)[:, None]
+        self.ext = None  # --ext_joints: (the joints' indices, their lowest and their highest goal in rad)
+        if c.ext_joints:
+            spec = [(i, float(lo), float(hi)) for name, lo, hi in (e.split(":") for e in c.ext_joints.split(",")) for i, d in enumerate(task.DOF) if name in d]
+            assert spec and len({i for i, _, _ in spec}) == len(spec), f"--ext_joints {c.ext_joints}: no joint, or a joint twice"
+            self.ext = tuple(np.asarray(x, t) for x, t in zip(zip(*spec), (int, np.float32, np.float32)))
+            self.ext_q0, self.ext_scale = (np.broadcast_to(x, (task.J,))[self.ext[0]] for x in (task.DEFAULT_Q, task.ACTION_SCALE))
         self.reward_cfg = self.sim.reward_cfg if c.gait_clock else dataclasses.replace(self.sim.reward_cfg, feet_phase=0.0)  # imagination's reward
         self.ckpt_extra = None  # a tracker policy: what save_ckpt writes besides the networks, the normalizers and the metadata as loaded
         if c.init_tracker:
@@ -230,6 +259,13 @@ class XSoma:
             self.H = extra["mem"]["hist"].shape[1]
             assert min(c.warmup_steps, c.buffer_steps) >= self.H, f"a start needs {self.H} collected steps for the tracker's history"
             rec_t["heading"] = jax.ShapeDtypeStruct((c.num_envs,), jnp.float32)
+        if self.ext is not None:  # on: the env's draw for its command; x, goal, speed: task.ext_step's state, x following the policy's target while it drives
+            x = jnp.broadcast_to(jnp.asarray(self.ext_q0), (c.num_envs, len(self.ext_q0)))
+            extra["ext"] = {"on": jnp.zeros((c.num_envs,), bool), "x": x + 0.0, "goal": x + 0.0, "speed": jnp.zeros_like(x)}  # separate buffers: the carry is donated
+            rec_t["ext"] = jax.ShapeDtypeStruct((c.num_envs,), jnp.float32)
+            if c.ext_blind:  # own: the policy's own last action for those joints, which it is fed instead of the applied one
+                extra["ext"]["own"] = jnp.zeros_like(x)
+                rec_t["ext_own"] = jax.ShapeDtypeStruct(x.shape, jnp.float32)
         # wm: network weights, wm_b: its normalizers; 12 + 2 J outputs: the changes of position, rotation, v, w (3 each), q, qd
         wm, wm_b = nets.wm_init(ks[2], self.wm_in, 12 + 2 * J, widths(c.wm_hidden))
         # Muon masks (Muon where True, Adam elsewhere): none for the policy, the hidden weight matrices for the world model
@@ -271,21 +307,48 @@ class XSoma:
         c = self.cfg
         s = carry["env"]
         noisy = (jnp.arange(c.num_envs) * c.det_share) % 1.0 >= c.det_share  # every 1 / det_share-th env acts without noise
+        seen = s
+        if self.ext is not None:
+            (i, lo, hi), e = self.ext, carry["ext"]
+            k_on, k_x = jax.random.split(jax.random.fold_in(key, 2))
+            # a state whose episode counter is a multiple of RESAMPLE has a new command (a reset or a resample)
+            on = jnp.where(s.t % task.RESAMPLE == 0, jax.random.uniform(k_on, (c.num_envs,)) < c.ext_share, e["on"])
+            ext = (on & (jnp.abs(s.cmd) < 0.01).all(-1))[:, None]
+            if c.ext_blind:
+                own = jnp.where((s.t == 0)[:, None], 0.0, e["own"])  # a reset zeroes the last action
+                q, qd, a_last = self.hide(ext, s.data.qpos[:, 7:], s.data.qvel[:, 6:], s.a_last, own)
+                seen = SimpleNamespace(data=SimpleNamespace(qpos=jnp.concatenate((s.data.qpos[:, :7], q), -1), qvel=jnp.concatenate((s.data.qvel[:, :6], qd), -1)),
+                                       a_last=a_last, t=s.t, cmd=s.cmd)  # fmt: skip
         if c.init_tracker:
-            a, mem = tracker.step({**self.frozen, **carry["pi"]}, carry["mem"], s, c.tracker_heading == "hold",
+            a, mem = tracker.step({**self.frozen, **carry["pi"]}, carry["mem"], seen, c.tracker_heading == "hold",
                                   jax.random.fold_in(key, 1) if c.tracker_noise else None, c.tracker_noise)  # fmt: skip
             carry = {**carry, "mem": mem}
         else:
             a = nets.pi_apply(carry["pi"], s.obs)
         a = a + jnp.where(noisy, c.action_noise, 0.0)[:, None] * jax.random.normal(key, (c.num_envs, self.J))
+        if self.ext is not None:
+            x, goal, speed = task.ext_step(k_x, e["x"], e["goal"], e["speed"], lo, hi)
+            x = jnp.where(ext, x, target_q(a)[:, i])
+            carry = {**carry, "ext": {"on": on, "x": x, "goal": goal, "speed": speed, **({"own": a[:, i]} if c.ext_blind else {})}}
+            a = a.at[:, i].set((x - self.ext_q0) / self.ext_scale)  # the policy's own action where it drives
         s1, tr = self.sim.step(s, a)
         rec, stats = self.record(s, s1, tr)
+        if self.ext is not None:
+            rec["ext"] = ext[:, 0].astype(jnp.float32)
+            if c.ext_blind:
+                rec["ext_own"] = own
         if c.init_tracker:  # the commanded heading of this step's observation (the memory holds the next step's)
             rec["heading"] = mem["heading"] - task.DT * s.cmd[:, 2]
         flat = rb.sanitize(rb.flatten(rec))
         flat["ok"] = flat["ok"] * (1 - tr.diverged.astype(jnp.float32))  # a physics failure is not a valid transition
         stats = {**stats, "nonfinite_env": 1 - flat["ok"].mean()}
         return self.ingest({**carry, "env": s1}, flat), stats
+
+    def hide(self, on, q, qd, a_last, own):
+        """(q, qd, a_last) as a policy gets them that is not shown the joints driven from outside: where `on` (..., 1), those
+        joints are at their default pose and at rest, and their last action is the policy's `own`."""
+        i, at = self.ext[0], lambda x, v: x.at[..., self.ext[0]].set(jnp.where(on, v, x[..., self.ext[0]]))  # noqa: E731
+        return at(q, self.ext_q0), at(qd, 0.0), at(a_last, own)
 
     # ------------------------------------------------------------------ world model
     def wm_rollout(self, wm, wm_b, S, targets, xis, heights, unroll=True):
@@ -350,6 +413,9 @@ class XSoma:
         if c.init_tracker:
             w = rb.sample_histories(buf, k_s, B, self.H, c.fall_starts, c.fall_lead or c.horizon)
             start = rb.nest({k: v[:, -1] for k, v in w.items()})
+            if self.ext is not None and c.ext_blind:  # the history as the policy saw it; `start` keeps the true state
+                q, qd, a_last = self.hide((w["ext"] > 0)[..., None], w["s_qpos"][..., 7:], w["s_qvel"][..., 6:], w["a_last"], w["ext_own"])
+                w = {**w, "s_qpos": jnp.concatenate((w["s_qpos"][..., :7], q), -1), "s_qvel": jnp.concatenate((w["s_qvel"][..., :6], qd), -1), "a_last": a_last}
             start["hist"] = tracker.history(self.frozen, w["s_qpos"], w["s_qvel"], w["a_last"], w["heading"] if c.tracker_heading == "hold" else None,
                                             w["done"], jax.random.fold_in(k_s, 1) if c.tracker_noise else None, c.tracker_noise)  # fmt: skip
         else:
@@ -391,13 +457,22 @@ class XSoma:
         if c.init_tracker:
             pi = {**self.frozen, **pi}
 
+        ext = None
+        if self.ext is not None:  # as in collection, from the last target; a start whose command was redrawn hands the joints back
+            (i, lo, hi), k_g, k_s = self.ext, *jax.random.split(jax.random.fold_in(keys[0], 2))
+            x = target_q(start["a_last"])[:, i]
+            ext_on = ((start["ext"] > 0) & (jnp.abs(start["cmd"]) < 0.01).all(-1))[:, None]
+            ext_j = ext_on & (jnp.arange(self.J) == i[:, None]).any(0)  # (B, J): the joints that the policy does not drive
+            ext = (x, jax.random.uniform(k_g, x.shape, minval=lo, maxval=hi), task.EXT_SPEED * jax.random.uniform(k_s, x.shape), start.get("ext_own", 0 * x))
+
         def step(carry, k):
-            S, v, a_last, cmd, freq, phase, t, mem = carry
+            S, v, a_last, cmd, freq, phase, t, mem, ext = carry
             k_o, k_c = jax.random.split(k)
             pen = None
             if c.init_tracker:
                 prev, heading = mem  # the H - 1 observations before this step's, the commanded heading
-                o = tracker.observation(pi, S[4], S[5], S[1], v.robot.w, a_last[:, pi["to_tracker"]], heading if c.tracker_heading == "hold" else None,
+                seen = self.hide(ext_on, S[4], S[5], a_last, ext[3]) if ext is not None and c.ext_blind else (S[4], S[5], a_last)
+                o = tracker.observation(pi, seen[0], seen[1], S[1], v.robot.w, seen[2][:, pi["to_tracker"]], heading if c.tracker_heading == "hold" else None,
                                         k_o if c.tracker_noise else None, c.tracker_noise)  # fmt: skip
                 # ponytail: the goal is encoded at every step though the command changes every 500; encode per rollout and at resamples if imagination is too slow
                 hist, g = jnp.concatenate((prev, o[:, None]), 1), tracker.goal(pi, cmd)
@@ -412,11 +487,22 @@ class XSoma:
             else:
                 obs, _ = task.observations(v.robot, a_last, cmd, phase, k_o)
                 a = nets.pi_apply(pi, obs, out_bf16=bf16)
+            if ext is not None:
+                ext = (*task.ext_step(jax.random.fold_in(k, 2), *ext[:3], lo, hi), a[:, i])
+                a = a.at[:, i].set(jnp.where(ext_on, (ext[0] - self.ext_q0) / self.ext_scale, a[:, i]))
             # the PD target: an env with an action delay applies the previous action instead of this one
             tgt = jnp.clip(jnp.where(delay[:, None] == 0, a, a_last), -task.ACTION_CLIP, task.ACTION_CLIP)
             S1 = nets.wm_step(wm, wm_b, S, v.height, v.soles, target_q(tgt), xi, task.DT, out_bf16=bf16)
             v1 = self.sim.view_state(S1, heights)
-            r = task.reward(task.reward_terms(v1.robot, v1.foot_h, a, a_last, cmd, phase), rcfg, scale)
+            if ext is None:
+                r = task.reward(task.reward_terms(v1.robot, v1.foot_h, a, a_last, cmd, phase), rcfg, scale)
+            else:  # the pose and the action rate of joints that the policy does not drive are not its cost
+                rb = v1.robot._replace(q=jnp.where(ext_j, task.DEFAULT_Q, v1.robot.q))
+                r = task.reward(task.reward_terms(rb, v1.foot_h, jnp.where(ext_j, 0.0, a), jnp.where(ext_j, 0.0, a_last), cmd, phase), rcfg, scale)
+            if c.track_l1:  # weighted as task.weighted weighs a penalty
+                r = r - task.DT * c.track_l1 * scale * task.track_l1(v1.robot, cmd, c.track_rel)
+            if c.stand_still:  # weighted as task.weighted weighs a penalty
+                r = r - task.DT * c.stand_still * scale * task.stand_still(v1.robot, v1.robot.foot_p - v.robot.foot_p, cmd)
             if c.feet_cross:  # weighted as task.weighted weighs a penalty
                 r = r - task.DT * c.feet_cross * scale * task.feet_cross(v1.robot)
             if c.foot_clearance:  # weighted as task.weighted weighs a penalty
@@ -435,14 +521,14 @@ class XSoma:
             cmd2, freq2 = task.sample_commands(k_c, B, self.cmd_scale)
             new = t1 % task.RESAMPLE == 0
             cmd1, freq1 = jnp.where(new[:, None], cmd2, cmd), jnp.where(new, freq2, freq)
-            return (S1, v1, a, cmd1, freq1, phase1, t1, mem), (r, d, pen)
+            return (S1, v1, a, cmd1, freq1, phase1, t1, mem, ext), (r, d, pen)
 
         if c.imag_remat == "dots":
             step = jax.checkpoint(step, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         elif c.imag_remat == "full":
             step = jax.checkpoint(step)
         mem = (start["hist"][:, :-1], start["heading"]) if c.init_tracker else None
-        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem)
+        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext)
         _, (r, d, pen) = jax.lax.scan(step, init, keys, unroll=c.imag_unroll)
         alive = jnp.cumprod(1 - d, 0)
         alive_before = jnp.concatenate((jnp.ones_like(alive[:1]), alive[:-1]), 0)  # a step's reward counts if alive before it
@@ -567,7 +653,10 @@ def main(argv=None):
     assert cfg.tracker_heading in ("hold", "rate") and cfg.feet_cross >= 0, "--tracker_heading is hold or rate, --feet_cross is not negative"
     assert min(cfg.self_clearance, cfg.self_clearance_term) >= 0, "--self_clearance and --self_clearance_term are not negative"
     assert min(cfg.foot_clearance, cfg.foot_clearance_height, cfg.push_vel) >= 0, "--foot_clearance, --foot_clearance_height and --push_vel are not negative"
-    assert not cfg.cmd_scale or len(cfg.cmd_scale.split(",")) == 3, "--cmd_scale is three factors, for vx, vy and wz: 1,0.5,1"
+    assert not cfg.cmd_scale or len(cfg.cmd_scale.split(",")) in (3, 4, 5), "--cmd_scale is three factors, for vx, vy and wz: 1,0.5,1 (a fourth: the share of zero commands, a fifth: of zero components)"
+    assert min(cfg.track_l1, cfg.stand_still) >= 0 and (not cfg.ext_blind or (cfg.ext_joints and cfg.init_tracker)), "--track_l1 is not negative, --ext_blind needs --ext_joints and --init_tracker"
+    assert cfg.track_rel >= 0 and (cfg.track_l1 or not cfg.track_rel), "--track_rel is not negative and needs --track_l1"
+    assert 0 <= cfg.ext_share <= 1 and (cfg.layout == "1GPU" or not cfg.ext_joints), "--ext_share is a share, --ext_joints needs --layout 1GPU"
     assert task.SELF_COLLISION or cfg.self_clearance == cfg.self_clearance_term == 0, "--self_clearance and --self_clearance_term need robot.json's self_collision"
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]
     if flags:  # XLA reads XLA_FLAGS when its backend starts, so they are set before XSoma(cfg) first uses the GPU

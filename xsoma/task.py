@@ -116,12 +116,18 @@ STAND_PHASE = math.pi  # the gait phase of both feet while standing
 
 def sample_commands(key, n, scale=None):
     """Draw n commands [vx, vy, wz] and gait frequencies; every resample redraws both (spec 5). `scale`, which is not
-    Holosoma's (train.py --cmd_scale): three factors on the ranges of vx, vy and wz."""
+    Holosoma's (train.py --cmd_scale): three factors on the ranges of vx, vy and wz; a fourth entry replaces STAND_PROB; a
+    fifth is the probability with which each component of a command is set to zero on its own (commands along one or two
+    axes, as an operator's stick gives them, are next to never drawn otherwise)."""
     kc, ks, kf = jax.random.split(key, 3)
     cmd = jax.random.uniform(kc, (n, 3), minval=-CMD_RANGE, maxval=CMD_RANGE)
+    stand = STAND_PROB
     if scale is not None:
-        cmd = cmd * jnp.asarray(scale, jnp.float32)
-    cmd = jnp.where(jax.random.uniform(ks, (n, 1)) <= STAND_PROB, 0.0, cmd)
+        cmd = cmd * jnp.asarray(scale[:3], jnp.float32)
+        stand = scale[3] if len(scale) > 3 else stand
+        if len(scale) > 4:
+            cmd = jnp.where(jax.random.uniform(jax.random.fold_in(kc, 1), (n, 3)) < scale[4], 0.0, cmd)
+    cmd = jnp.where(jax.random.uniform(ks, (n, 1)) <= stand, 0.0, cmd)
     return cmd, jax.random.uniform(kf, (n,), minval=GAIT_FREQ[0], maxval=GAIT_FREQ[1])
 
 
@@ -242,6 +248,42 @@ def foot_clearance(sole_h, step_xy, height=FOOT_CLEARANCE_HEIGHT):
     stands still and for one lifted above `height`, however it moves."""
     speed = jnp.sqrt(jnp.sum(jnp.square(step_xy), -1) + 1e-12) / DT  # the 1e-12 keeps the gradient finite at rest
     return jnp.sum(jnp.maximum(0.0, height - sole_h) * speed, -1)
+
+
+def stand_still(robot: Robot, feet_step, cmd):
+    """The standing penalty term, which is not Holosoma's (train.py --stand_still): under a zero command, the base's planar speed
+    (m/s) plus its angular speed (rad/s) plus the speed of each foot contact point, from its displacement `feet_step` (N, 2, 3)
+    in one policy step (m/s); zero under any other command. Norms, not squares: a slow drift is pulled to zero as hard as a step."""
+    norm = lambda x: jnp.sqrt(jnp.sum(jnp.square(x), -1) + 1e-12)  # noqa: E731  (the 1e-12 keeps the gradient finite at rest)
+    return jnp.where((jnp.abs(cmd) < 0.01).all(-1), norm(robot.v[:, :2]) + norm(robot.w) + norm(feet_step).sum(-1) / DT, 0.0)
+
+
+def track_l1(robot: Robot, cmd, rel=0.0):
+    """The plain tracking error, which is not Holosoma's (train.py --track_l1): the distance between the commanded and the
+    base's planar velocity (m/s, base frame) plus that of the yaw rates (rad/s). The tracking rewards' exp(-error^2 / 0.25)
+    is flat near zero: standing still under a command of 0.2 m/s loses 15 % of it. `rel` > 0 (train.py --track_rel): the
+    error is divided by the command's size, the norm of its three components taken as at least `rel`, so that standing still
+    costs at least 1 under every command of that size or more; a command of size 1 and a zero command keep the plain error."""
+    v_b = jnp.einsum("nji,nj->ni", robot.R, robot.v)
+    size = lambda x: jnp.sqrt(jnp.sum(jnp.square(x), -1) + 1e-12)  # noqa: E731
+    err = size(cmd[:, :2] - v_b[:, :2]) + jnp.abs(cmd[:, 2] - robot.w[:, 2])
+    return err / jnp.where(size(cmd) < 0.01, 1.0, jnp.maximum(size(cmd), rel)) if rel else err
+
+
+EXT_SPEED = 2.0  # rad/s: a joint that something else drives moves to each goal at a speed of U[0, EXT_SPEED]
+EXT_PERIOD = 2.0  # s: the mean time between two goals
+
+
+def ext_step(key, x, goal, speed, lo, hi):
+    """One policy step of the targets (rad) of joints that something else than the policy drives (train.py --ext_joints):
+    (x, goal, speed), each (N, n). Every joint moves towards its goal at its speed; with probability DT / EXT_PERIOD an env
+    draws new goals in [lo, hi] and new speeds for all of its joints."""
+    # ponytail: constant speed, no acceleration limit; smooth the ramps if the drives should not see velocity steps
+    k_n, k_g, k_s = jax.random.split(key, 3)
+    new = jax.random.uniform(k_n, x.shape[:-1] + (1,)) < DT / EXT_PERIOD
+    goal = jnp.where(new, jax.random.uniform(k_g, x.shape, minval=lo, maxval=hi), goal)
+    speed = jnp.where(new, EXT_SPEED * jax.random.uniform(k_s, x.shape), speed)
+    return x + jnp.clip(goal - x, -speed * DT, speed * DT), goal, speed
 
 
 def reward_terms(robot: Robot, foot_heights, a, a_prev, cmd, phase):
