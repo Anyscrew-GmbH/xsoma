@@ -32,7 +32,8 @@ action-rate penalties leave them out. `--stand_still` weighs a penalty on any mo
 command (task.stand_still), in imagination only. A fourth entry of `--cmd_scale` is the share of zero commands. With
 `--ext_blind 1` a tracker policy is not shown those joints while they are driven from outside (`XSoma.hide`). `--track_l1`
 weighs a penalty on the plain distance between the command and the base's velocity (task.track_l1), in imagination only;
-`--track_rel` takes that distance relative to the command's size.
+`--track_rel` takes that distance relative to the command's size. `--torque_limit` weighs a penalty on the PD torque that an
+imagined action asks for beyond `--torque_soft` x each joint's effort limit (task.torque_limit), in imagination only.
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -156,6 +157,9 @@ class Config:
     #                         at least this; not for a zero command), so that slow commands weigh as much as fast ones (0: off)
     stand_still: float = 0.0  # weight of the penalty task.stand_still on the base and the feet moving under a zero command, in
     #                           imagination's reward only and weighted as feet_cross is (0: not computed)
+    torque_limit: float = 0.0  # weight of the penalty task.torque_limit on the PD torque that the imagined action asks for beyond
+    #                            torque_soft x the effort limit, in imagination's reward only and weighted as feet_cross is (0: not computed)
+    torque_soft: float = 0.9  # with torque_limit: the share of the effort limit from which on the torque is penalized
     # runtime
     imag_unroll: int = 4  # unrolling of the imagination loop (speed saturates at 4; compile time grows with it)
     imag_remat: str = "none"  # rematerialization of the imagination steps: none | dots | full (less memory, slower)
@@ -507,6 +511,9 @@ class XSoma:
                 r = r - task.DT * c.feet_cross * scale * task.feet_cross(v1.robot)
             if c.foot_clearance:  # weighted as task.weighted weighs a penalty
                 r = r - task.DT * c.foot_clearance * scale * self.foot_clearance(v, v1)
+            if c.torque_limit:  # weighted as task.weighted weighs a penalty; the torque of the step's first substep, from its start
+                x = task.torque_limit(v.robot.q, v.robot.qd, target_q(tgt), c.torque_soft)
+                r = r - task.DT * c.torque_limit * scale * (x if ext is None else jnp.where(ext_j, 0.0, x)).sum(-1)
             d = self.termination(v1.clearance)
             if c.tilt_term:  # S1[1]: the base's rotation matrix, whose last entry is the cosine of its tilt (width: term_tau, in cosine)
                 d = 1 - (1 - d) * (1 - self.termination((S1[1][..., 2, 2] - np.cos(c.tilt_term))[..., None]))
@@ -656,6 +663,7 @@ def main(argv=None):
     assert not cfg.cmd_scale or len(cfg.cmd_scale.split(",")) in (3, 4, 5), "--cmd_scale is three factors, for vx, vy and wz: 1,0.5,1 (a fourth: the share of zero commands, a fifth: of zero components)"
     assert min(cfg.track_l1, cfg.stand_still) >= 0 and (not cfg.ext_blind or (cfg.ext_joints and cfg.init_tracker)), "--track_l1 is not negative, --ext_blind needs --ext_joints and --init_tracker"
     assert cfg.track_rel >= 0 and (cfg.track_l1 or not cfg.track_rel), "--track_rel is not negative and needs --track_l1"
+    assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
     assert 0 <= cfg.ext_share <= 1 and (cfg.layout == "1GPU" or not cfg.ext_joints), "--ext_share is a share, --ext_joints needs --layout 1GPU"
     assert task.SELF_COLLISION or cfg.self_clearance == cfg.self_clearance_term == 0, "--self_clearance and --self_clearance_term need robot.json's self_collision"
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]

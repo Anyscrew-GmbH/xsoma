@@ -270,6 +270,14 @@ def track_l1(robot: Robot, cmd, rel=0.0):
     return err / jnp.where(size(cmd) < 0.01, 1.0, jnp.maximum(size(cmd), rel)) if rel else err
 
 
+def torque_limit(q, qd, target, soft=0.9):
+    """The torque-limit penalty term, which is not Holosoma's (train.py --torque_limit): per joint (N, J), how far the PD law's
+    torque with the nominal gains, KP (target - q) - KD qd before the clip, exceeds `soft` x EFFORT, in units of EFFORT:
+    max(0, |tau| / EFFORT - soft). The simulator clips the torque, so beyond EFFORT a larger request changes nothing there;
+    this term is what tells the policy. Linear, not squared: every step near the limit is pulled down as hard as a rare spike."""
+    return jnp.maximum(0.0, jnp.abs(KP * (target - q) - KD * qd) / EFFORT - soft)
+
+
 EXT_SPEED = 2.0  # rad/s: a joint that something else drives moves to each goal at a speed of U[0, EXT_SPEED]
 EXT_PERIOD = 2.0  # s: the mean time between two goals
 
