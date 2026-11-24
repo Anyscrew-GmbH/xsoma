@@ -85,6 +85,8 @@ CONTACT_FORCE = 1.0  # N: a net contact force above this on a termination body e
 SELF_COLLISION = _ROBOT.get("self_collision") if ROBOT_DIR else None
 SELF_CLEARANCE_MARGIN = 0.02  # m: self_clearance penalizes every pair of the two groups' colliders that is closer than this
 FOOT_CLEARANCE_HEIGHT = 0.06  # m: foot_clearance penalizes a foot that moves sideways or forward lower than this over the terrain
+TOUCHDOWN_HEIGHT = 0.03  # m: touchdown_speed penalizes a foot that moves down lower than this over the terrain
+G = 9.81  # m/s^2
 
 
 class Robot(NamedTuple):
@@ -286,6 +288,22 @@ def joint_range(q, lo, hi):
     [lo, hi] (rad), linear. A range inside the model's own lets a policy learn to stay off limits that something else than the
     model enforces, without a hard stop in the simulation that it could learn to lean on."""
     return jnp.maximum(0.0, q - hi) + jnp.maximum(0.0, lo - q)
+
+
+def touchdown_speed(sole_h, feet_dz, height=TOUCHDOWN_HEIGHT):
+    """The touchdown-speed penalty term, which is not Holosoma's (train.py --touchdown_speed): per foot whose lowest sole point
+    ends the step less than `height` over the terrain (`sole_h`, (N, 2)), the square of its downward speed (m/s), from the
+    vertical displacement `feet_dz` (N, 2) of its contact point in one policy step; summed over the feet. Zero for a foot that
+    rises, stands or is higher: a foot that lands is charged for the speed it closes the last centimeters with."""
+    return jnp.sum(jnp.where(sole_h < height, jnp.square(jnp.maximum(0.0, -feet_dz / DT)), 0.0), -1)
+
+
+def impact_accel(v0, v1):
+    """The impact penalty term, which is not Holosoma's (train.py --impact_accel): the square of the base's upward acceleration
+    over one policy step in units of g, from its world velocities `v0`, `v1` (N, 3) at the step's start and end; zero while it
+    accelerates down. A proxy of the ground force above the robot's weight (net vertical force = mass x (a_z + g) of the center
+    of mass), for a model that predicts no contact forces; as an IMU on the base measures it."""
+    return jnp.square(jnp.maximum(0.0, (v1[:, 2] - v0[:, 2]) / (DT * G)))
 
 
 EXT_SPEED = 2.0  # rad/s: a joint that something else drives moves to each goal at a speed of U[0, EXT_SPEED]

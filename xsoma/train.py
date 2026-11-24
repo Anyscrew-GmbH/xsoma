@@ -36,6 +36,8 @@ weighs a penalty on the plain distance between the command and the base's veloci
 imagined action asks for beyond `--torque_soft` x each joint's effort limit (task.torque_limit), in imagination only.
 `--range_penalty` weighs a penalty on the joints of `--range_joints name:lo:hi,...` outside those ranges (task.joint_range), in
 imagination only. Sixth and seventh entries of `--cmd_scale` scale a share of the commands down (slow commands).
+`--touchdown_speed` weighs a penalty on a foot's downward speed lower than `--touchdown_height` over the terrain
+(task.touchdown_speed) and `--impact_accel` one on the base's upward acceleration (task.impact_accel), both in imagination only.
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -167,6 +169,12 @@ class Config:
     #                             imagination's reward only and weighted as feet_cross is (0: not computed)
     range_joints: str = ""  # with range_penalty: "name:lo:hi,...": every joint whose name contains `name` is penalized outside
     #                         [lo, hi] rad (e.g. limits that the robot's runtime enforces inside the model's joint ranges)
+    touchdown_speed: float = 0.0  # weight of the penalty task.touchdown_speed on a foot moving down while its lowest sole point is
+    #                               less than touchdown_height over the terrain, in imagination's reward only and weighted as
+    #                               feet_cross is (0: not computed)
+    touchdown_height: float = task.TOUCHDOWN_HEIGHT  # m
+    impact_accel: float = 0.0  # weight of the penalty task.impact_accel on the base's upward acceleration over a step (a proxy of
+    #                            the ground force's peaks), in imagination's reward only and weighted as feet_cross is (0: not computed)
     support: float = 0.0  # share of the episodes that start with the robot on a rope that pulls its torso up (sim.Sim._support,
     #                       task.support_force): at rest in the default pose, the policy acting from the start, no command while on
     #                       the rope, which is paid out after a random hold and then taken off. The rope's top and pay-out speed are
@@ -235,7 +243,7 @@ class XSoma:
                               cmd_scale=self.cmd_scale, push_vel=c.push_vel, support=c.support,
                               support_gap=tuple(float(x) for x in c.support_gap.split(",")),
                               support_point=tuple(float(x) for x in c.support_point.split(",")) if c.support_point else None))  # fmt: skip
-        if c.foot_clearance:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
+        if c.foot_clearance or c.touchdown_speed:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
             self.sole_foot = np.asarray(self.sim.sole_frame) == np.arange(2, 4)[:, None]
         self.ext = None  # --ext_joints: (the joints' indices, their lowest and their highest goal in rad)
         if c.ext_joints:
@@ -469,8 +477,11 @@ class XSoma:
     def foot_clearance(self, v, v1):
         """task.foot_clearance of the step from the view `v` to `v1`: each foot's lowest sole point over the terrain after the
         step, and how far its contact point moved."""
-        low = jnp.where(self.sole_foot, v1.soles[..., None, :], jnp.inf).min(-1)
-        return task.foot_clearance(low, (v1.robot.foot_p - v.robot.foot_p)[..., :2], self.cfg.foot_clearance_height)
+        return task.foot_clearance(self.sole_low(v1), (v1.robot.foot_p - v.robot.foot_p)[..., :2], self.cfg.foot_clearance_height)
+
+    def sole_low(self, v):
+        """(N, 2) each foot's lowest sole point over the terrain in the view `v`."""
+        return jnp.where(self.sole_foot, v.soles[..., None, :], jnp.inf).min(-1)
 
     def imagine(self, pi, wm, wm_b, start, keys, scale, heights, pi0=None):
         """The loss of the policy update: the negative mean discounted return of `horizon` imagined steps from `start`. A step
@@ -542,6 +553,11 @@ class XSoma:
                 r = r - task.DT * c.torque_limit * scale * (x if ext is None else jnp.where(ext_j, 0.0, x)).sum(-1)
             if c.range_penalty:  # weighted as task.weighted weighs a penalty; the pose the step ends in
                 r = r - task.DT * c.range_penalty * scale * task.joint_range(v1.robot.q[:, self.rng[0]], *self.rng[1:]).sum(-1)
+            if c.touchdown_speed:  # weighted as task.weighted weighs a penalty; feet near the terrain at the step's end
+                dz = (v1.robot.foot_p - v.robot.foot_p)[..., 2]
+                r = r - task.DT * c.touchdown_speed * scale * task.touchdown_speed(self.sole_low(v1), dz, c.touchdown_height)
+            if c.impact_accel:  # weighted as task.weighted weighs a penalty; the world model's base velocities
+                r = r - task.DT * c.impact_accel * scale * task.impact_accel(v.robot.v, v1.robot.v)
             d = self.termination(v1.clearance)
             if c.tilt_term:  # S1[1]: the base's rotation matrix, whose last entry is the cosine of its tilt (width: term_tau, in cosine)
                 d = 1 - (1 - d) * (1 - self.termination((S1[1][..., 2, 2] - np.cos(c.tilt_term))[..., None]))
@@ -697,6 +713,7 @@ def main(argv=None):
     assert min(cfg.track_l1, cfg.stand_still) >= 0 and (not cfg.ext_blind or (cfg.ext_joints and cfg.init_tracker)), "--track_l1 is not negative, --ext_blind needs --ext_joints and --init_tracker"
     assert cfg.track_rel >= 0 and (cfg.track_l1 or not cfg.track_rel), "--track_rel is not negative and needs --track_l1"
     assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
+    assert min(cfg.touchdown_speed, cfg.touchdown_height, cfg.impact_accel) >= 0, "--touchdown_speed, --touchdown_height and --impact_accel are not negative"
     gap = [float(x) for x in cfg.support_gap.split(",")]
     assert 0 <= cfg.support <= 1 and len(gap) == 2 and gap[0] <= gap[1], "--support is a share, --support_gap is lo,hi in m"
     assert not cfg.support_point or (cfg.support and len(cfg.support_point.split(",")) == 3), "--support_point is x,y,z in m and needs --support"
