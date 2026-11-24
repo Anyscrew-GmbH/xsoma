@@ -166,6 +166,9 @@ class Config:
     #                       the last two entries of the dynamics context; imagination pays the rope out as the simulator does (0: off)
     support_gap: str = "-0.02,0.05"  # with support: the range (m) of the lowest sole point's height over the terrain while hanging
     #                                  (negative: on the terrain, the rope carrying part of the weight or slack)
+    support_point: str = ""  # with support: x,y,z (m) of the rope's attachment in the torso body's frame, the rope vertical above it
+    #                          (an overhead crane): the robot hangs turned until the point is above its center of mass ("": the
+    #                          body's center of mass, upright)
     # runtime
     imag_unroll: int = 4  # unrolling of the imagination loop (speed saturates at 4; compile time grows with it)
     imag_remat: str = "none"  # rematerialization of the imagination steps: none | dots | full (less memory, slower)
@@ -223,7 +226,8 @@ class XSoma:
         self.sim = Sim(SimCfg(num_envs=c.num_envs, terrain=c.terrain, terrain_scale=c.terrain_scale, foot=c.foot, preset=c.preset,
                               sole_friction=bool(c.sole_friction), random_start=bool(c.random_start), seed=42 + c.seed,
                               cmd_scale=self.cmd_scale, push_vel=c.push_vel, support=c.support,
-                              support_gap=tuple(float(x) for x in c.support_gap.split(","))))  # fmt: skip
+                              support_gap=tuple(float(x) for x in c.support_gap.split(",")),
+                              support_point=tuple(float(x) for x in c.support_point.split(",")) if c.support_point else None))  # fmt: skip
         if c.foot_clearance:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
             self.sole_foot = np.asarray(self.sim.sole_frame) == np.arange(2, 4)[:, None]
         self.ext = None  # --ext_joints: (the joints' indices, their lowest and their highest goal in rad)
@@ -680,6 +684,7 @@ def main(argv=None):
     assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
     gap = [float(x) for x in cfg.support_gap.split(",")]
     assert 0 <= cfg.support <= 1 and len(gap) == 2 and gap[0] <= gap[1], "--support is a share, --support_gap is lo,hi in m"
+    assert not cfg.support_point or (cfg.support and len(cfg.support_point.split(",")) == 3), "--support_point is x,y,z in m and needs --support"
     assert 0 <= cfg.ext_share <= 1 and (cfg.layout == "1GPU" or not cfg.ext_joints), "--ext_share is a share, --ext_joints needs --layout 1GPU"
     assert task.SELF_COLLISION or cfg.self_clearance == cfg.self_clearance_term == 0, "--self_clearance and --self_clearance_term need robot.json's self_collision"
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]

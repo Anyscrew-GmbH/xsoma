@@ -42,7 +42,7 @@ from mujoco import mjx
 from . import scene, task
 from . import terrain as terrain_mod
 from .kin import Kinematics
-from .rot import mv3, quat_to_mat, tr3
+from .rot import mv3, quat_to_mat, skew, tr3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,6 +61,9 @@ class SimCfg:
     support_gap: tuple = (-0.02, 0.05)  # m, U per such episode: the lowest sole point over the terrain while the rope holds the
     #                                     nominal robot in the default pose; negative: on the terrain, the rope carrying part of the
     #                                     weight (from minus the rope's stretch under the weight on, none: slack)
+    support_point: tuple | None = None  # m, the rope's attachment in the frame of the rope's body (task.TORSO), the rope vertical
+    #                                     above it (an overhead crane), see Sim._rope; None: at that body's center of mass, the rope's
+    #                                     length taken at the root
     nconmax: int = 96  # contacts per world (the size of Holosoma's MuJoCo Warp contact pool)
     njmax: int = 576  # constraint rows per world (Holosoma: max(6 x 96, 4 nv))
     naccdmax: int = 0  # heightfield (CCD) contacts per world; 0: nconmax
@@ -295,6 +298,8 @@ class Sim:
             self.self_distance = SelfDistance(m, np.flatnonzero(m.geom_contype & 4), np.flatnonzero(m.geom_conaffinity & 4))
         self.mass_ids = np.asarray([m.body(f"robot_{b}").id for b in task.MASS_BODIES])
         self.torso = m.body(f"robot_{task.TORSO}").id
+        if c.support_point is not None:  # Sim._rope
+            self._hang_pose(m)
 
         self.mx = mjx.put_model(m, impl="warp")
         self.dx = mjx.make_data(m, impl="warp", naconmax=N * c.nconmax, njmax=c.njmax, naccdmax=N * (c.naccdmax or c.nconmax))
@@ -407,7 +412,9 @@ class Sim:
         def one(m_, d, tg, kp_, kd_, top_):
             def substep(_, dd):
                 dd = dd.replace(ctrl=task.torques(dd.qpos[7:], dd.qvel[6:], tg, kp_, kd_))
-                if top_ is not None:
+                if top_ is not None and self.cfg.support_point is not None:
+                    dd = dd.replace(xfrc_applied=dd.xfrc_applied.at[self.torso].set(self._rope(m_.body_ipos[self.torso], dd.qpos, dd.qvel, top_)))
+                elif top_ is not None:
                     dd = dd.replace(xfrc_applied=dd.xfrc_applied.at[self.torso, 2].set(task.support_force(top_, dd.qpos[2], dd.qvel[2])))
                 return mjx.step(m_, dd)
 
@@ -477,17 +484,54 @@ class Sim:
                           offset=jnp.where(on, offset, s.offset), t=jnp.where(on2, 0, s.t), push_t=jnp.where(on2, 0, s.push_t),
                           push_at=jnp.where(on2, push_at, s.push_at), ep_sums=jnp.where(on, 0.0, s.ep_sums))  # fmt: skip
 
+    def _hang_pose(self, m):
+        """SimCfg.support_point: the pose in which the nominal robot rests on the rope, the default joint pose turned about the
+        horizontal axis that puts the point straight above the robot's center of mass (with the root at the origin): its root
+        quaternion (sup_quat), the root's height over the lowest sole point in it (sup_stand), and the point's height in it
+        minus the standing height difference (sup_lift: the rope's length is taken at the point's height - sup_lift, so the rope's
+        top keeps its meaning of SimCfg.support)."""
+        d = mujoco.MjData(m)
+        d.qpos[:7], d.qpos[7:] = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0), task.DEFAULT_Q
+        mujoco.mj_kinematics(m, d)
+        mujoco.mj_comPos(m, d)
+        self.sup_kin, self.sup_local = Kinematics(m, [m.body(self.torso).name]), np.asarray(self.cfg.support_point, np.float32)
+        point = lambda R: np.asarray(self._point(jnp.zeros(3), jnp.asarray(R, jnp.float32), jnp.asarray(task.DEFAULT_Q), np.zeros(3))[0])  # noqa: E731
+        r = point(np.eye(3)) - d.subtree_com[1]
+        axis = np.cross(r, (0.0, 0.0, 1.0))
+        half = np.arctan2(np.linalg.norm(axis), r[2]) / 2
+        quat = np.concatenate(([np.cos(half)], np.sin(half) * axis / max(np.linalg.norm(axis), 1e-12)))
+        R = np.asarray(quat_to_mat(jnp.asarray(quat, jnp.float32)))
+        P, Rs = self.kin.forward(jnp.zeros(3), jnp.asarray(R, jnp.float32), jnp.asarray(task.DEFAULT_Q))
+        self.sup_quat, self.sup_stand = quat.astype(np.float32), float(-(np.asarray(P[self.sole_frame] + mv3(Rs[self.sole_frame], self.sole_local))[:, 2] - self.sole_radius).min())
+        self.sup_lift = float(point(R)[2] + self.sup_stand - self.stand_h)
+
+    def _point(self, p, R, q, ipos):
+        """World positions of the rope's point and of the rope body's center of mass (body frame offset ipos), root pose (p, R)."""
+        Pb, Rb = self.sup_kin.forward(p, R, q)
+        return Pb[0] + mv3(Rb[0], jnp.asarray(self.sup_local)), Pb[0] + mv3(Rb[0], ipos)
+
+    def _rope(self, ipos, qpos, qvel, top):
+        """SimCfg.support_point: the rope's wrench on its body (6,: force, torque about the center of mass ipos, as xfrc_applied):
+        the tension task.support_force of the point's height - sup_lift and its vertical velocity, pulling straight up at it."""
+        R = quat_to_mat(qpos[3:7])
+        (pt, com), (v, _) = jax.jvp(lambda p, R, q: self._point(p, R, q, ipos), (qpos[:3], R, qpos[7:]), (qvel[:3], R @ skew(qvel[3:6]), qvel[6:]))
+        T = task.support_force(top, pt[2] - self.sup_lift, v[2])
+        f = jnp.stack((jnp.zeros_like(T), jnp.zeros_like(T), T))
+        return jnp.concatenate((f, jnp.cross(pt - com, f)))
+
     def _support(self, key, qpos, qvel, cmd, heights):
-        """SimCfg.support for fresh envs: a share of them starts on the rope, at rest and upright in the default pose with the
-        lowest sole point support_gap over the terrain under the pelvis (on it for a negative gap), and without a command (an
-        operator gives none while the robot hangs); the rope's top is where it holds the nominal robot at that gap, and it is
-        paid out after a hold of task.SUPPORT_HOLD. Returns qpos, qvel, cmd, the rope's top and the steps until the pay-out."""
+        """SimCfg.support for fresh envs: a share of them starts on the rope, at rest in the default pose (upright; with
+        SimCfg.support_point turned as it hangs, _hang_pose) with the lowest sole point support_gap over the terrain under the
+        pelvis (on it for a negative gap), and without a command (an operator gives none while the robot hangs); the rope's top
+        is where it holds the nominal robot at that gap, and it is paid out after a hold of task.SUPPORT_HOLD. Returns qpos, qvel, cmd, the rope's top and the steps until the pay-out."""
         N, (lo, hi) = self.N, self.cfg.support_gap
         k_on, k_gap, k_hold = jax.random.split(key, 3)
         on = (jax.random.uniform(k_on, (N,)) < self.cfg.support)[:, None]
         gap = jax.random.uniform(k_gap, (N,), minval=lo, maxval=hi)
-        z = self.height(heights, qpos[:, 0], qpos[:, 1]) + self.stand_h + jnp.maximum(gap, 0.0)
-        pose = jnp.concatenate((qpos[:, :2], z[:, None], qpos[:, 3:7], jnp.broadcast_to(jnp.asarray(task.DEFAULT_Q), (N, task.J))), -1)
+        hung = self.cfg.support_point is not None  # then at rest in the hanging pose (_hang_pose)
+        z = self.height(heights, qpos[:, 0], qpos[:, 1]) + (self.sup_stand if hung else self.stand_h) + jnp.maximum(gap, 0.0)
+        quat = jnp.broadcast_to(jnp.asarray(self.sup_quat), (N, 4)) if hung else qpos[:, 3:7]
+        pose = jnp.concatenate((qpos[:, :2], z[:, None], quat, jnp.broadcast_to(jnp.asarray(task.DEFAULT_Q), (N, task.J))), -1)
         hold = jax.random.uniform(k_hold, (N,), minval=task.SUPPORT_HOLD[0], maxval=task.SUPPORT_HOLD[1])
         return (jnp.where(on, pose, qpos), jnp.where(on, 0.0, qvel), jnp.where(on, 0.0, cmd), jnp.where(on[:, 0], gap + self.hang, task.SUPPORT_OFF),
                 (hold / task.DT).astype(jnp.int32))  # fmt: skip

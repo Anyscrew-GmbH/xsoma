@@ -9,6 +9,11 @@ task.support_pay_out, sim.Sim._support and train.py's --support. CPU only.
             at the default pose and the rope's tension on the torso before every 5 ms step: hanging with a gap of 3 cm, the soles
             stay 1 to 3.5 cm over the plane (it swings and tilts on the rope) and the rope carries the weight; at a gap of minus half the stretch the feet stand and
             the rope carries part of the weight. (MuJoCo Warp's physics does not run on the CPU: Sim.physics itself is not run.)
+  point     SimCfg.support_point (bundled G1, plane): fresh envs on the rope start turned as they hang (the point straight above
+            the center of mass of the default pose); on MuJoCo's CPU engine with Sim._rope's wrench at a point behind and above the
+            center of mass, hanging 3 cm up the point stays above the center of mass, the root tilts forward by somewhat less than
+            atan(horizontal / vertical offset of the point from the center of mass) (the PD-held joints give way) and the rope
+            carries the weight; with the feet loaded (gap -2 cm, on the toes) the tilt stays while the rope carries part of it
   standin   on test_finetune's stand-in with a context whose last two entries are a rope: imagination's starts on the rope get a
             zero command (and the standing gait phase), every imagined step's world model sees the rope paid out as
             support_pay_out does, and on the rope the commands stay zero at a resample; without the option the context stays
@@ -86,6 +91,54 @@ def test_reset():
           f"{t_hang / weight:.2f} x weight; gap -{sim.hang * 500:.1f} mm -> soles {low2 * 100:.2f} cm, rope {t_part / weight:.2f} x weight")
 
 
+def test_point():
+    import mujoco
+
+    from xsoma.sim import Sim, SimCfg
+
+    point = (-0.12, 0.0, 0.35)  # in the torso body's frame: behind and above the center of mass
+    sim = Sim(SimCfg(num_envs=64, terrain="plane", support=1.0, support_point=point))
+    m, d = sim.m, mujoco.MjData(sim.m)
+    d.qpos[3:7], d.qpos[7:] = [1, 0, 0, 0], task.DEFAULT_Q
+    mujoco.mj_kinematics(m, d)
+    mujoco.mj_comPos(m, d)
+    r = d.xpos[sim.torso] + d.xmat[sim.torso].reshape(3, 3) @ point - d.subtree_com[1]
+    expect = np.arctan2(np.hypot(r[0], r[1]), r[2])  # the pitch that puts the point above the center of mass
+    assert r[0] < -0.05 and abs(2 * np.arccos(sim.sup_quat[0]) - expect) < 1e-4, (r, sim.sup_quat, expect)
+    q, *_ = (np.asarray(x) for x in sim._support(jax.random.PRNGKey(1), jnp.zeros((64, m.nq)), jnp.zeros((64, m.nv)), jnp.zeros((64, 3)), jnp.zeros((1, 1))))
+    assert np.allclose(q[:, 3:7], sim.sup_quat) and (q[:, 2] >= sim.sup_stand - 1e-6).all()
+
+    rope = jax.jit(sim._rope)
+    weight = m.body_mass.sum() * 9.81
+
+    def hang(gap, seconds=4.0):
+        """Starts at rest in the hanging pose, the joints held at the default pose by the PD law; returns the means over the
+        last second of the root's tilt (rad, + forward), the rope's tension / weight and the point's horizontal distance (m,
+        signed in x) from the center of mass."""
+        mujoco.mj_resetData(m, d)
+        d.qpos[2], d.qpos[3:7], d.qpos[7:] = sim.sup_stand + max(gap, 0.0), sim.sup_quat, task.DEFAULT_Q
+        top, out, n = sim.stand_h + gap + sim.hang, [], round(seconds / m.opt.timestep)
+        for k in range(n):
+            d.ctrl[:] = task.torques(d.qpos[7:], d.qvel[6:], np.zeros(task.J), 1.0, 1.0)
+            d.xfrc_applied[sim.torso] = w = np.asarray(rope(m.body_ipos[sim.torso], d.qpos, d.qvel, top))
+            mujoco.mj_step(m, d)
+            if k >= n - round(1.0 / m.opt.timestep):
+                mujoco.mj_comPos(m, d)
+                R = d.xmat[1].reshape(3, 3)
+                out.append((np.arctan2(R[0, 2], R[2, 2]), w[2] / weight, (d.xpos[sim.torso] + d.xmat[sim.torso].reshape(3, 3) @ point - d.subtree_com[1])[0]))
+        return np.mean(out, 0)
+
+    # hanging, the point stays above the center of mass; the tilt is a little under the rigid estimate, since the PD-held
+    # joints give way under the turned pose (the legs swing back towards the vertical)
+    tilt, t_hang, dx = hang(0.03)
+    assert 0.6 * expect < tilt < 1.05 * expect and abs(t_hang - 1) < 0.03 and abs(dx) < 0.01, (tilt, expect, t_hang, dx)
+    tilt2, t_part, _ = hang(-0.02)  # standing on the toes of the turned feet: the rope still carries most of the weight
+    assert tilt2 > 0.5 * expect and 0.1 < t_part < 0.9, (tilt2, t_part)
+    print(f"point: hanging pose turned {expect:.3f} rad = atan({np.hypot(r[0], r[1]):.3f} / {r[2]:.3f} m); CPU physics, last of 4 s: gap 3 cm -> tilt "
+          f"{tilt:.3f} rad, rope {t_hang:.2f} x weight, point {dx * 100:+.2f} cm from above the center of mass; feet loaded -> tilt {tilt2:.3f} rad, "
+          f"rope {t_part:.2f} x weight")
+
+
 def test_standin():
     import test_finetune as tf
 
@@ -154,4 +207,5 @@ def test_standin():
 if __name__ == "__main__":
     test_rope()
     test_reset()
+    test_point()
     test_standin()

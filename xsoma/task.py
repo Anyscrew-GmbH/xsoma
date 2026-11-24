@@ -376,7 +376,8 @@ PUSH_INTERVAL = (5.0, 10.0)  # s between pushes, per env; a push overwrites the 
 PUSH_VEL = 1.0
 
 # A rope that holds the robot up by its torso at the start of an episode (sim.SimCfg.support, train.py --support; not Holosoma's):
-# it pulls straight up on the torso body, taut while the pelvis is below the rope's top; after a hold it is paid out, then taken off
+# it pulls straight up on the torso body (at its center of mass, or at sim.SimCfg.support_point), taut while the pelvis (or that
+# point) is below the rope's top; after a hold it is paid out, then taken off
 SUPPORT_K, SUPPORT_C = 5e4, 1e3  # the rope's stiffness (N/m) and damping (N s/m)
 SUPPORT_HOLD = (0.0, 8.0)  # s, U per episode: the hold before the pay-out
 SUPPORT_SPEED = 0.05  # m/s: the pay-out
