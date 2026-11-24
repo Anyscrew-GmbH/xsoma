@@ -86,6 +86,8 @@ SELF_COLLISION = _ROBOT.get("self_collision") if ROBOT_DIR else None
 SELF_CLEARANCE_MARGIN = 0.02  # m: self_clearance penalizes every pair of the two groups' colliders that is closer than this
 FOOT_CLEARANCE_HEIGHT = 0.06  # m: foot_clearance penalizes a foot that moves sideways or forward lower than this over the terrain
 TOUCHDOWN_HEIGHT = 0.03  # m: touchdown_speed penalizes a foot that moves down lower than this over the terrain
+TURN_STEP_HEIGHT = 0.02  # m: turn_stance counts a foot as standing whose lowest sole point is lower than this over the terrain
+TURN_STEP_WIDTH = 0.01  # m: the width of turn_stance's sigmoid (its gradient; wide enough to reach a foot flat on the ground)
 G = 9.81  # m/s^2
 
 
@@ -296,6 +298,21 @@ def touchdown_speed(sole_h, feet_dz, height=TOUCHDOWN_HEIGHT):
     vertical displacement `feet_dz` (N, 2) of its contact point in one policy step; summed over the feet. Zero for a foot that
     rises, stands or is higher: a foot that lands is charged for the speed it closes the last centimeters with."""
     return jnp.sum(jnp.where(sole_h < height, jnp.square(jnp.maximum(0.0, -feet_dz / DT)), 0.0), -1)
+
+
+def turn_stance(st, sole_h):
+    """Seconds each foot has stood (N, 2), one policy step on (train.py --turn_step): a foot whose lowest sole point `sole_h` is
+    under TURN_STEP_HEIGHT over the terrain stands (DT added), a higher one is reset to zero. The value counts hard; its gradient
+    is that of a sigmoid of width TURN_STEP_WIDTH (straight through), so lifting a standing foot lowers it."""
+    soft = jax.nn.sigmoid((TURN_STEP_HEIGHT - sole_h) / TURN_STEP_WIDTH)
+    return ((sole_h < TURN_STEP_HEIGHT) + soft - jax.lax.stop_gradient(soft)) * (st + DT)
+
+
+def turn_step(st, wz, stance):
+    """The step-rate penalty term, which is not Holosoma's (train.py --turn_step): |yaw-rate command| `wz` (N,) x the seconds by
+    which each foot's stance `st` (N, 2; turn_stance) exceeds `stance`, summed over the feet. Turning asks each foot to lift at
+    least every `stance` seconds; straight walking and standing (wz = 0) are not charged."""
+    return jnp.abs(wz) * jnp.maximum(0.0, st - stance).sum(-1)
 
 
 def impact_accel(v0, v1):

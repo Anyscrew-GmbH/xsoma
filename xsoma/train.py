@@ -38,6 +38,9 @@ imagined action asks for beyond `--torque_soft` x each joint's effort limit (tas
 imagination only. Sixth and seventh entries of `--cmd_scale` scale a share of the commands down (slow commands).
 `--touchdown_speed` weighs a penalty on a foot's downward speed lower than `--touchdown_height` over the terrain
 (task.touchdown_speed) and `--impact_accel` one on the base's upward acceleration (task.impact_accel), both in imagination only.
+`--turn_step` weighs a penalty, scaled by the yaw-rate command, on a foot that stands longer than `--turn_step_stance` seconds
+(task.turn_step; stance from the feet's heights in the imagined states), in imagination only. `--friction_surfaces lo:hi,...`
+draws each episode's friction coefficient from a surface picked uniformly, then uniformly in its range (sim.Sim._mu).
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -60,7 +63,7 @@ import numpy as np
 
 from . import buffer as rb
 from . import nets, optim, task, tracker, wandb_log
-from .sim import Sim, SimCfg, unflatten
+from .sim import Sim, SimCfg, surfaces, unflatten
 
 
 @dataclasses.dataclass
@@ -173,6 +176,12 @@ class Config:
     #                               less than touchdown_height over the terrain, in imagination's reward only and weighted as
     #                               feet_cross is (0: not computed)
     touchdown_height: float = task.TOUCHDOWN_HEIGHT  # m
+    turn_step: float = 0.0  # weight of the penalty task.turn_step (|yaw-rate command| x a foot's stance beyond turn_step_stance), in
+    #                         imagination's reward only and weighted as feet_cross is (0: not computed). Each imagined rollout starts
+    #                         its stance clocks at zero (the replay buffer holds no contact history)
+    turn_step_stance: float = 0.4  # s
+    friction_surfaces: str = ""  # "lo:hi,lo:hi,...": per episode a surface uniformly, then the friction coefficient U[lo, hi] of it,
+    #                              for every geom (the soles with sole_friction); "": task.FRICTION once per env (sim.SimCfg)
     impact_accel: float = 0.0  # weight of the penalty task.impact_accel on the base's upward acceleration over a step (a proxy of
     #                            the ground force's peaks), in imagination's reward only and weighted as feet_cross is (0: not computed)
     support: float = 0.0  # share of the episodes that start with the robot on a rope that pulls its torso up (sim.Sim._support,
@@ -247,8 +256,9 @@ class XSoma:
                               sole_friction=bool(c.sole_friction), random_start=bool(c.random_start), seed=42 + c.seed,
                               cmd_scale=self.cmd_scale, push_vel=c.push_vel, support=c.support,
                               support_gap=tuple(float(x) for x in c.support_gap.split(",")),
-                              support_point=tuple(float(x) for x in c.support_point.split(",")) if c.support_point else None))  # fmt: skip
-        if c.foot_clearance or c.touchdown_speed:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
+                              support_point=tuple(float(x) for x in c.support_point.split(",")) if c.support_point else None,
+                              friction_surfaces=surfaces(c.friction_surfaces)))  # fmt: skip
+        if c.foot_clearance or c.touchdown_speed or c.turn_step:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
             self.sole_foot = np.asarray(self.sim.sole_frame) == np.arange(2, 4)[:, None]
         self.ext = None  # --ext_joints: (the joints' indices, their lowest and their highest goal in rad)
         if c.ext_joints:
@@ -512,7 +522,7 @@ class XSoma:
             ext = (x, jax.random.uniform(k_g, x.shape, minval=lo, maxval=hi), task.EXT_SPEED * jax.random.uniform(k_s, x.shape), start.get("ext_own", 0 * x))
 
         def step(carry, k):
-            S, v, a_last, cmd, freq, phase, t, mem, ext, xi = carry
+            S, v, a_last, cmd, freq, phase, t, mem, ext, xi, st = carry
             k_o, k_c = jax.random.split(k)
             pen = None
             if c.init_tracker:
@@ -561,6 +571,9 @@ class XSoma:
             if c.touchdown_speed:  # weighted as task.weighted weighs a penalty; feet near the terrain at the step's end
                 dz = (v1.robot.foot_p - v.robot.foot_p)[..., 2]
                 r = r - task.DT * c.touchdown_speed * scale * task.touchdown_speed(self.sole_low(v1), dz, c.touchdown_height)
+            if c.turn_step:  # weighted as task.weighted weighs a penalty; the feet's heights in the imagined state
+                st = task.turn_stance(st, self.sole_low(v1))
+                r = r - task.DT * c.turn_step * scale * task.turn_step(st, cmd[:, 2], c.turn_step_stance)
             if c.impact_accel:  # weighted as task.weighted weighs a penalty; the world model's base velocities
                 r = r - task.DT * c.impact_accel * scale * task.impact_accel(v.robot.v, v1.robot.v)
             d = self.termination(v1.clearance)
@@ -581,14 +594,14 @@ class XSoma:
                 top, rate = task.support_pay_out(xi[:, -2], xi[:, -1])
                 xi = jnp.concatenate((xi[:, :-2], top[:, None], rate[:, None]), -1)
                 cmd1 = jnp.where((top > task.SUPPORT_OFF)[:, None], 0.0, cmd1)
-            return (S1, v1, a, cmd1, freq1, phase1, t1, mem, ext, xi), (r, d, pen)
+            return (S1, v1, a, cmd1, freq1, phase1, t1, mem, ext, xi, st), (r, d, pen)
 
         if c.imag_remat == "dots":
             step = jax.checkpoint(step, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         elif c.imag_remat == "full":
             step = jax.checkpoint(step)
         mem = (start["hist"][:, :-1], start["heading"]) if c.init_tracker else None
-        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext, start["xi"])
+        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext, start["xi"], jnp.zeros((B, 2)))
         _, (r, d, pen) = jax.lax.scan(step, init, keys, unroll=c.imag_unroll)
         alive = jnp.cumprod(1 - d, 0)
         alive_before = jnp.concatenate((jnp.ones_like(alive[:1]), alive[:-1]), 0)  # a step's reward counts if alive before it
@@ -719,6 +732,8 @@ def main(argv=None):
     assert cfg.track_rel >= 0 and (cfg.track_l1 or not cfg.track_rel), "--track_rel is not negative and needs --track_l1"
     assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
     assert min(cfg.touchdown_speed, cfg.touchdown_height, cfg.impact_accel) >= 0, "--touchdown_speed, --touchdown_height and --impact_accel are not negative"
+    assert cfg.turn_step >= 0 and cfg.turn_step_stance > 0, "--turn_step is not negative, --turn_step_stance is positive"
+    surfaces(cfg.friction_surfaces)
     gap = [float(x) for x in cfg.support_gap.split(",")]
     assert 0 <= cfg.support <= 1 and len(gap) == 2 and gap[0] <= gap[1], "--support is a share, --support_gap is lo,hi in m"
     assert not cfg.support_point or (cfg.support and len(cfg.support_point.split(",")) == 3), "--support_point is x,y,z in m and needs --support"

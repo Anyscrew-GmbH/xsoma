@@ -63,7 +63,7 @@ import numpy as np  # noqa: E402
 
 from . import nets, task, tracker, wandb_log  # noqa: E402
 from . import terrain as terrain_mod  # noqa: E402
-from .sim import Sim, SimCfg, unflatten  # noqa: E402
+from .sim import Sim, SimCfg, surfaces, unflatten  # noqa: E402
 
 SOLE_SINK = 0.01  # m: sole_sink_frac counts the steps in which a sole collider point is further than this below the terrain
 WINDOW = 100  # steps before a fall that its record keeps (2 s)
@@ -285,12 +285,13 @@ def load_policy(path, which="avg"):
     return [{k.split("/")[2]: jnp.asarray(z[k]) for k in z.files if k.startswith(f"{which}/{i}/")} for i in range(n)]
 
 
-def make_sim(n=2048, scale=0.5, sole_friction=False, preset="fast_sac", terrain="mix", steps=task.MAX_EPISODE + 1, cmd_scale=None, push_vel=task.PUSH_VEL):
+def make_sim(n=2048, scale=0.5, sole_friction=False, preset="fast_sac", terrain="mix", steps=task.MAX_EPISODE + 1, cmd_scale=None, push_vel=task.PUSH_VEL, friction_surfaces=()):
     """The evaluation simulator; the defaults are the setting that Holosoma's MuJoCo Warp baselines train in (terrain scale 0.5,
     sole friction fixed at 0.8). `steps`: the policy steps of an episode that does not end in a fall. `cmd_scale`: three
     factors on the command ranges of vx, vy and wz. `push_vel`: the size of the pushes (m/s), 0 for none."""
     return Sim(SimCfg(num_envs=n, terrain=terrain, terrain_scale=scale, preset=preset, sole_friction=sole_friction, random_start=False,
-                      max_episode=steps - 1, cmd_scale=cmd_scale and tuple(cmd_scale), push_vel=push_vel))  # fmt: skip
+                      max_episode=steps - 1, cmd_scale=cmd_scale and tuple(cmd_scale), push_vel=push_vel,
+                      friction_surfaces=friction_surfaces))  # fmt: skip
 
 
 def run_all(sim: Sim, jobs, seed=1, which="avg", out=None, tracker_meta=None, tracker_heading=None, falls=None, episodes=None):
@@ -350,10 +351,12 @@ def main(argv=None):
     p.add_argument("--steps", type=int, default=task.MAX_EPISODE + 1, help="policy steps of an episode (the time-out); 50 per second")
     p.add_argument("--cmd_scale", type=float, nargs=3, default=None, help="factors on the command ranges of vx, vy and wz (default: U[-1, 1] each)")
     p.add_argument("--push_vel", type=float, default=task.PUSH_VEL, help="size of the pushes in m/s; 0: no pushes")
+    p.add_argument("--friction_surfaces", default="", help="lo:hi,...: friction per episode as train.py's option (with --sole_friction 1 on the soles too)")
     p.add_argument("--falls", default=None, help="write every fall with its last 2 s to this JSON-lines file")
     p.add_argument("--episodes", default=None, help="write a summary of every episode to this JSON-lines file")
     a = p.parse_args(argv)
-    sim = make_sim(a.n, a.scale, bool(a.sole_friction), a.preset, a.terrain, a.steps, a.cmd_scale, push_vel=a.push_vel)
+    sim = make_sim(a.n, a.scale, bool(a.sole_friction), a.preset, a.terrain, a.steps, a.cmd_scale, push_vel=a.push_vel,
+                   friction_surfaces=surfaces(a.friction_surfaces))
     for name in (a.falls, a.episodes):
         if name:
             open(name, "w").close()

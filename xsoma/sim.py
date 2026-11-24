@@ -72,6 +72,15 @@ class SimCfg:
     ccd_tolerance: float = 1e-6  # GJK / EPA tolerance of the heightfield collisions (MuJoCo's default)
     tiles: bool = True  # one heightfield per terrain tile (scene.py: a single 160 x 240 m field is numerically unstable)
     seed: int = 42  # terrain layout and env origins; the start-up randomization uses the key passed to init
+    friction_surfaces: tuple = ()  # ((lo, hi), ...): each episode draws a surface uniformly, then the friction coefficient
+    #                                uniformly in its range (Sim._mu); (): task.FRICTION's buckets once per env at start-up
+
+
+def surfaces(spec):
+    """--friction_surfaces (train.py, evaluate.py) "lo:hi,..." as ((lo, hi), ...)."""
+    out = tuple(tuple(float(x) for x in e.split(":")) for e in spec.split(",") if e)
+    assert all(len(e) == 2 and 0 <= e[0] <= e[1] for e in out), f"--friction_surfaces {spec!r}: lo:hi,... with 0 <= lo <= hi"
+    return out
 
 
 wp.config.log_level = wp.LOG_WARNING  # no line per loaded MuJoCo Warp kernel
@@ -352,16 +361,34 @@ class Sim:
             u = jax.random.uniform(jax.random.fold_in(key, 1), (N, len(p), 4), minval=task.PAYLOAD_LO, maxval=task.PAYLOAD_HI)
             inertia = inertia.at[:, p].multiply(u[..., :1] / m.body_mass[p][:, None])
             mass, ipos = mass.at[:, p].set(u[..., 0]), ipos.at[:, p].set(u[..., 1:])
-        lo, hi = task.FRICTION
-        mu = lo + (hi - lo) * (jax.random.randint(k_mu, (N,), 0, task.FRICTION_BUCKETS) + 0.5) / task.FRICTION_BUCKETS
-        friction = tile(m.geom_friction)
-        keep = np.isin(np.arange(m.ngeom), self.sole_geoms) & (not c.sole_friction)  # Holosoma's MuJoCo backends: soles stay at 0.8
-        geom_friction = friction.at[:, :, 0].set(jnp.where(keep, friction[:, :, 0], mu[:, None]))
+        geom_friction = self._friction(tile(m.geom_friction), self._mu(k_mu))
         if self.terrain is None:
             origin = np.zeros((N, 3), np.float32)
         else:
             origin = terrain_mod.sample_env_origins(self.terrain, N, np.random.RandomState(c.seed)).astype(np.float32)
         return World(jnp.asarray(origin), mass, inertia, ipos, geom_friction, jnp.asarray(self.heights), self.mx)
+
+    def _mu(self, key):
+        """(N,) sliding friction coefficients: with SimCfg.friction_surfaces a surface drawn uniformly, then U[lo, hi] of it; else
+        one of task.FRICTION_BUCKETS equally spaced values of task.FRICTION."""
+        if self.cfg.friction_surfaces:
+            k_s, k_u = jax.random.split(key)
+            lo, hi = jnp.asarray(self.cfg.friction_surfaces, jnp.float32)[jax.random.randint(k_s, (self.N,), 0, len(self.cfg.friction_surfaces))].T
+            return lo + (hi - lo) * jax.random.uniform(k_u, (self.N,))
+        lo, hi = task.FRICTION
+        return lo + (hi - lo) * (jax.random.randint(key, (self.N,), 0, task.FRICTION_BUCKETS) + 0.5) / task.FRICTION_BUCKETS
+
+    def _friction(self, friction, mu):
+        """geom_friction (N, ngeom, 3) with the sliding coefficient of every geom set to its env's mu, the soles' only with
+        sole_friction. Every geom of a contact then has mu: the soles by their priority (scene.py), any other pair as MuJoCo's
+        maximum of the two. Torsional and rolling coefficients stay the model's (the soles' contacts have condim 3: unused)."""
+        keep = np.isin(np.arange(self.m.ngeom), self.sole_geoms) & (not self.cfg.sole_friction)  # Holosoma's MuJoCo backends: soles stay at 0.8
+        return friction.at[:, :, 0].set(jnp.where(keep, friction[:, :, 0], mu[:, None]))
+
+    def _new_surface(self, w: World, done, key) -> World:
+        """`w` with a friction coefficient drawn anew (_mu) for the envs where `done` is set."""
+        new = self._friction(w.geom_friction, self._mu(key))
+        return w._replace(geom_friction=jnp.where(done[:, None, None], new, w.geom_friction))
 
     def context(self, s: State):
         """(N, 72) dynamics context xi of each env: its PD gain scales, link mass scales, torso added mass and CoM offset,
@@ -476,6 +503,8 @@ class Sim:
         if self.cfg.support:
             qpos, qvel, cmd, sup, wait = self._support(jax.random.fold_in(key, 3), qpos, qvel, cmd, s.world.heights)
             s = s._replace(sup=jnp.where(on2, sup, s.sup), sup_wait=jnp.where(on2, wait, s.sup_wait))
+        if self.cfg.friction_surfaces:  # a new surface per episode
+            s = s._replace(world=self._new_surface(s.world, done, jax.random.fold_in(key, 4)))
         d = s.data
         # the solver's warm start (the previous acceleration) belongs to the old state, so it is cleared too
         d = d.replace(qpos=jnp.where(on, qpos, d.qpos), qvel=jnp.where(on, qvel, d.qvel), qacc_warmstart=jnp.where(on, 0.0, d.qacc_warmstart))
