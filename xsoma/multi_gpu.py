@@ -41,7 +41,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, SingleDeviceSharding
 from jax.sharding import PartitionSpec as P
 
-from . import optim, task
+from . import optim, task, wandb_log
 from .train import XSoma, save_ckpt
 
 START_KEYS = ("s_qpos", "s_qvel", "xi", "a_last", "cmd", "phase", "t", "freq", "offset", "delay")  # what imagination reads of a start
@@ -259,6 +259,7 @@ def run(cfg, t_launch):
         it, env_steps = int(it), float(env_steps)
         rec = {"it": it, "train_s": train_s, "wall_s": time.time() - t_launch, "env_steps": env_steps, "nonfinite": int(cL["nonfinite"]), **stats}
         logf.write(json.dumps(rec) + "\n")
+        wandb_log.log(rec, step=it)
         print(f"it {it} | {train_s / 60:.2f} min | {env_steps / 1e6:.1f}M steps | len {stats['ep_len']:.0f} lin {stats['rew_tracking_lin_vel']:.3f} "
               f"ang {stats['rew_tracking_ang_vel']:.3f} r {stats['reward']:.4f} s {stats['scale']:.3f} | wm {stats['wm']:.4f} e8 {stats['wm8']:.4f} | "
               f"G {stats['G']:.3f} r_im {stats['r']:.4f} surv {stats['surv']:.3f} gn {stats['gn']:.2f} | {cfg.log_every / max(train_s - prev_s, 1e-9):.1f} it/s "

@@ -59,7 +59,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import buffer as rb
-from . import nets, optim, task, tracker
+from . import nets, optim, task, tracker, wandb_log
 from .sim import Sim, SimCfg, unflatten
 
 
@@ -196,6 +196,11 @@ class Config:
     eval_sole_friction: int = 0  # 0: soles at friction 0.8 in evaluation, as in Holosoma's MuJoCo training
     seed: int = 0  # the terrain is drawn with seed 42 + seed, so seed 0 uses Holosoma's default terrain seed (42)
     log_dir: str = "runs/xsoma"
+    wandb_project: str = ""  # Weights & Biases project of the log records' numbers and the options ("": off, unless WANDB_PROJECT is
+    #                          set); wandb_log.py lists what is sent and what not
+    wandb_entity: str = ""  # "": WANDB_ENTITY, else wandb's default
+    wandb_name: str = ""  # run name; "": WANDB_NAME, else a generated one
+    wandb_mode: str = ""  # online | offline | disabled; "": WANDB_MODE, else online
     jax_cache: str = "~/.cache/xsoma/jax"  # persistent compilation cache ("" for none): later runs load their programs
     xla_flags: str = "--xla_gpu_enable_triton_gemm=false"  # extra XLA flags, comma-separated, set before JAX's backend starts
     #                                                        (cuBLAS for every GEMM: faster on Hopper, neutral elsewhere)
@@ -725,6 +730,7 @@ def main(argv=None):
     os.makedirs(os.path.join(cfg.log_dir, "ckpt"), exist_ok=True)
     with open(os.path.join(cfg.log_dir, "config.json"), "w") as f:
         json.dump(dataclasses.asdict(cfg), f, indent=1)
+    wandb_log.start(dataclasses.asdict(cfg), cfg.log_dir)
     if cfg.layout != "1GPU":  # several GPUs: multi_gpu.run trains, logs, saves checkpoints and evaluates in the same formats
         from .multi_gpu import run
 
@@ -765,6 +771,7 @@ def main(argv=None):
         it, env_steps = int(carry["it"]), float(carry["env_steps"])
         rec = {"it": it, "train_s": train_s, "wall_s": time.time() - t_launch, "env_steps": env_steps, "nonfinite": int(carry["nonfinite"]), **stats}
         logf.write(json.dumps(rec) + "\n")
+        wandb_log.log(rec, step=it)
         # The printed line: iteration, training time, env steps | len (mean length of finished episodes), lin and ang (Holosoma's
         # tracking rewards of finished episodes), r (reward per step), s (penalty scale) | wm (world-model loss), e8 (its error at
         # a window's 8th step) | G (imagined return), r_im (imagined reward per step), surv (imagined rollouts alive at the end),

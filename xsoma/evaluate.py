@@ -61,7 +61,7 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 
-from . import nets, task, tracker  # noqa: E402
+from . import nets, task, tracker, wandb_log  # noqa: E402
 from . import terrain as terrain_mod  # noqa: E402
 from .sim import Sim, SimCfg, unflatten  # noqa: E402
 
@@ -329,6 +329,7 @@ def run_all(sim: Sim, jobs, seed=1, which="avg", out=None, tracker_meta=None, tr
         if run and out:
             with open(os.path.join(run, out + ".jsonl"), "a") as f:
                 f.write(json.dumps(rec) + "\n")
+            wandb_log.log(rec, prefix="eval/")
         yield rec
 
 
