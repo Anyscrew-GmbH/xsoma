@@ -118,7 +118,8 @@ def sample_commands(key, n, scale=None):
     """Draw n commands [vx, vy, wz] and gait frequencies; every resample redraws both (spec 5). `scale`, which is not
     Holosoma's (train.py --cmd_scale): three factors on the ranges of vx, vy and wz; a fourth entry replaces STAND_PROB; a
     fifth is the probability with which each component of a command is set to zero on its own (commands along one or two
-    axes, as an operator's stick gives them, are next to never drawn otherwise)."""
+    axes, as an operator's stick gives them, are next to never drawn otherwise); a sixth and a seventh entry (s, f): a share s
+    of the commands is scaled by f on top (slow commands, which are rare in the uniform draw otherwise)."""
     kc, ks, kf = jax.random.split(key, 3)
     cmd = jax.random.uniform(kc, (n, 3), minval=-CMD_RANGE, maxval=CMD_RANGE)
     stand = STAND_PROB
@@ -127,6 +128,8 @@ def sample_commands(key, n, scale=None):
         stand = scale[3] if len(scale) > 3 else stand
         if len(scale) > 4:
             cmd = jnp.where(jax.random.uniform(jax.random.fold_in(kc, 1), (n, 3)) < scale[4], 0.0, cmd)
+        if len(scale) > 5:
+            cmd = jnp.where(jax.random.uniform(jax.random.fold_in(kc, 2), (n, 1)) < scale[5], scale[6] * cmd, cmd)
     cmd = jnp.where(jax.random.uniform(ks, (n, 1)) <= stand, 0.0, cmd)
     return cmd, jax.random.uniform(kf, (n,), minval=GAIT_FREQ[0], maxval=GAIT_FREQ[1])
 
@@ -276,6 +279,13 @@ def torque_limit(q, qd, target, soft=0.9):
     max(0, |tau| / EFFORT - soft). The simulator clips the torque, so beyond EFFORT a larger request changes nothing there;
     this term is what tells the policy. Linear, not squared: every step near the limit is pulled down as hard as a rare spike."""
     return jnp.maximum(0.0, jnp.abs(KP * (target - q) - KD * qd) / EFFORT - soft)
+
+
+def joint_range(q, lo, hi):
+    """The joint-range penalty term, which is not Holosoma's (train.py --range_penalty): per joint (N, n), how far q lies outside
+    [lo, hi] (rad), linear. A range inside the model's own lets a policy learn to stay off limits that something else than the
+    model enforces, without a hard stop in the simulation that it could learn to lean on."""
+    return jnp.maximum(0.0, q - hi) + jnp.maximum(0.0, lo - q)
 
 
 EXT_SPEED = 2.0  # rad/s: a joint that something else drives moves to each goal at a speed of U[0, EXT_SPEED]

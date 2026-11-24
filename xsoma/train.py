@@ -34,6 +34,8 @@ command (task.stand_still), in imagination only. A fourth entry of `--cmd_scale`
 weighs a penalty on the plain distance between the command and the base's velocity (task.track_l1), in imagination only;
 `--track_rel` takes that distance relative to the command's size. `--torque_limit` weighs a penalty on the PD torque that an
 imagined action asks for beyond `--torque_soft` x each joint's effort limit (task.torque_limit), in imagination only.
+`--range_penalty` weighs a penalty on the joints of `--range_joints name:lo:hi,...` outside those ranges (task.joint_range), in
+imagination only. Sixth and seventh entries of `--cmd_scale` scale a share of the commands down (slow commands).
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -78,6 +80,7 @@ class Config:
     #                      "1,0.5,1" for sideways commands up to 0.5 m/s ("": Holosoma's U[-1, 1]); the evaluation after training
     #                      keeps Holosoma's ranges (evaluate.py --cmd_scale). "x,y,z,p": p is the share of zero commands (Holosoma's 0.2);
     #                      "x,y,z,p,q": each component of a command is also zero with probability q
+    #                      "x,y,z,p,q,s,f": a share s of the commands is also scaled by f (slow commands)
     push_vel: float = task.PUSH_VEL  # m/s: a push in collection sets the root's (vx, vy) to U[-push_vel, push_vel] each (0: none); the
     #                                  evaluation keeps Holosoma's pushes
     # schedule
@@ -160,6 +163,10 @@ class Config:
     torque_limit: float = 0.0  # weight of the penalty task.torque_limit on the PD torque that the imagined action asks for beyond
     #                            torque_soft x the effort limit, in imagination's reward only and weighted as feet_cross is (0: not computed)
     torque_soft: float = 0.9  # with torque_limit: the share of the effort limit from which on the torque is penalized
+    range_penalty: float = 0.0  # weight of the penalty task.joint_range on the joints of range_joints outside their ranges, in
+    #                             imagination's reward only and weighted as feet_cross is (0: not computed)
+    range_joints: str = ""  # with range_penalty: "name:lo:hi,...": every joint whose name contains `name` is penalized outside
+    #                         [lo, hi] rad (e.g. limits that the robot's runtime enforces inside the model's joint ranges)
     support: float = 0.0  # share of the episodes that start with the robot on a rope that pulls its torso up (sim.Sim._support,
     #                       task.support_force): at rest in the default pose, the policy acting from the start, no command while on
     #                       the rope, which is paid out after a random hold and then taken off. The rope's top and pay-out speed are
@@ -236,6 +243,11 @@ class XSoma:
             assert spec and len({i for i, _, _ in spec}) == len(spec), f"--ext_joints {c.ext_joints}: no joint, or a joint twice"
             self.ext = tuple(np.asarray(x, t) for x, t in zip(zip(*spec), (int, np.float32, np.float32)))
             self.ext_q0, self.ext_scale = (np.broadcast_to(x, (task.J,))[self.ext[0]] for x in (task.DEFAULT_Q, task.ACTION_SCALE))
+        self.rng = None  # --range_joints: (the joints' indices, their lower and their upper bound in rad)
+        if c.range_penalty:
+            spec = [(i, float(lo), float(hi)) for name, lo, hi in (e.split(":") for e in c.range_joints.split(",")) for i, d in enumerate(task.DOF) if name in d]
+            assert spec and len({i for i, _, _ in spec}) == len(spec), f"--range_joints {c.range_joints}: no joint, or a joint twice"
+            self.rng = tuple(np.asarray(x, t) for x, t in zip(zip(*spec), (int, np.float32, np.float32)))
         self.reward_cfg = self.sim.reward_cfg if c.gait_clock else dataclasses.replace(self.sim.reward_cfg, feet_phase=0.0)  # imagination's reward
         self.ckpt_extra = None  # a tracker policy: what save_ckpt writes besides the networks, the normalizers and the metadata as loaded
         if c.init_tracker:
@@ -528,6 +540,8 @@ class XSoma:
             if c.torque_limit:  # weighted as task.weighted weighs a penalty; the torque of the step's first substep, from its start
                 x = task.torque_limit(v.robot.q, v.robot.qd, target_q(tgt), c.torque_soft)
                 r = r - task.DT * c.torque_limit * scale * (x if ext is None else jnp.where(ext_j, 0.0, x)).sum(-1)
+            if c.range_penalty:  # weighted as task.weighted weighs a penalty; the pose the step ends in
+                r = r - task.DT * c.range_penalty * scale * task.joint_range(v1.robot.q[:, self.rng[0]], *self.rng[1:]).sum(-1)
             d = self.termination(v1.clearance)
             if c.tilt_term:  # S1[1]: the base's rotation matrix, whose last entry is the cosine of its tilt (width: term_tau, in cosine)
                 d = 1 - (1 - d) * (1 - self.termination((S1[1][..., 2, 2] - np.cos(c.tilt_term))[..., None]))
@@ -678,7 +692,8 @@ def main(argv=None):
     assert cfg.tracker_heading in ("hold", "rate") and cfg.feet_cross >= 0, "--tracker_heading is hold or rate, --feet_cross is not negative"
     assert min(cfg.self_clearance, cfg.self_clearance_term) >= 0, "--self_clearance and --self_clearance_term are not negative"
     assert min(cfg.foot_clearance, cfg.foot_clearance_height, cfg.push_vel) >= 0, "--foot_clearance, --foot_clearance_height and --push_vel are not negative"
-    assert not cfg.cmd_scale or len(cfg.cmd_scale.split(",")) in (3, 4, 5), "--cmd_scale is three factors, for vx, vy and wz: 1,0.5,1 (a fourth: the share of zero commands, a fifth: of zero components)"
+    assert not cfg.cmd_scale or len(cfg.cmd_scale.split(",")) in (3, 4, 5, 7), "--cmd_scale is three factors, for vx, vy and wz: 1,0.5,1 (a fourth: the share of zero commands, a fifth: of zero components, a sixth and seventh: the share of commands scaled and the factor)"
+    assert cfg.range_penalty >= 0 and bool(cfg.range_penalty) == bool(cfg.range_joints), "--range_penalty is not negative and goes with --range_joints"
     assert min(cfg.track_l1, cfg.stand_still) >= 0 and (not cfg.ext_blind or (cfg.ext_joints and cfg.init_tracker)), "--track_l1 is not negative, --ext_blind needs --ext_joints and --init_tracker"
     assert cfg.track_rel >= 0 and (cfg.track_l1 or not cfg.track_rel), "--track_rel is not negative and needs --track_l1"
     assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
