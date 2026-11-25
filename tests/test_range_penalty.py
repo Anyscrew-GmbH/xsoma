@@ -1,10 +1,11 @@
 """The joint-range penalty and the slow-command entries of --cmd_scale (run: python tests/test_range_penalty.py, or pytest):
-task.joint_range, train.py's --range_penalty and --range_joints, and task.sample_commands' sixth and seventh entries. CPU only.
+task.joint_range, train.py's --range_penalty, --range_target and --range_joints, and task.sample_commands' sixth and seventh entries. CPU only.
 
   term      task.joint_range on hand-made poses: per joint the distance outside [lo, hi], zero inside, a finite gradient
   commands  a sixth and seventh entry (s, f): a share s of the commands is the same draw times f, the rest unchanged
   standin   on test_finetune's stand-in: without the option the term is not computed; with --range_penalty W the loss gains
             W x dt x penalty scale x the discounted term summed over the named joints, on the pose each imagined step ends in
+  target    with --range_target W instead: the same on the PD target of each imagined step's action
 """
 
 import os
@@ -79,9 +80,46 @@ def test_standin():
           f"step ends in; {(terms > 0).mean():.2f} of the imagined steps have a term; compiled: gradient norm {float(st['gn']):.3f}")
 
 
+def test_target():
+    """--range_target W alone: the loss gains W x dt x scale x the discounted term on the PD target each imagined step's action
+    asks for (the target the world model is given), not on the pose."""
+    W, SPEC = 3.0, "knee:-0.02:0.02,waist:-0.01:0.01"
+    with mock.patch.multiple(task, **tf.ROBOT):
+        plain = tf.build(action_noise=0.0)
+        carry, step = plain.init(jax.random.PRNGKey(0)), jax.jit(plain.collect_step)
+        for k in jax.random.split(jax.random.PRNGKey(1), tf.STEPS):
+            carry, _ = step(carry, k)
+        start = plain.sample_starts(carry["buf"], jax.random.PRNGKey(2))
+        args = (carry["pi"], carry["wm"], carry["wm_b"], start, jax.random.split(jax.random.PRNGKey(3), plain.cfg.horizon), carry["env"].scale, carry["env"].world.heights)
+        with jax.disable_jit():
+            loss0 = float(plain.imagine(*args)[0])
+        log = {"term": [], "end": [], "wm": []}
+
+        def record(name, f):
+            def g(*a, **kw):
+                log[name].append((a, f(*a, **kw)))
+                return log[name][-1][1]
+
+            return g
+
+        pen = tf.build(action_noise=0.0, range_target=W, range_joints=SPEC)
+        with jax.disable_jit(), mock.patch.object(task, "joint_range", record("term", task.joint_range)), \
+                mock.patch.object(train.XSoma, "termination", record("end", train.XSoma.termination)), mock.patch.object(train.nets, "wm_step", record("wm", train.nets.wm_step)):  # fmt: skip
+            loss = float(pen.imagine(*args)[0])
+        for ((q, lo, hi), _), (w, _) in zip(log["term"], log["wm"]):  # the targets given to the world model, the named joints only
+            assert np.allclose(q, w[5][:, [1, 3]]) and np.allclose(hi, [0.02, 0.01])
+        terms = np.stack([t for _, t in log["term"]]).sum(-1)
+        alive = np.cumprod(1 - np.stack([x for _, x in log["end"]]), 0)
+        disc = (pen.cfg.gamma ** np.arange(pen.cfg.horizon))[:, None] * np.concatenate((np.ones_like(alive[:1]), alive[:-1]))
+        want = W * task.DT * float(args[5]) * (disc * terms).sum(0).mean()
+        assert len(terms) == pen.cfg.horizon and want > 1e-4 and np.isclose(loss - loss0, want, rtol=1e-3), (loss, loss0, want)
+    print(f"target: --range_target {W}: the loss gains weight x dt x scale x the discounted term ({want:.4f}) on each step's PD target")
+
+
 if __name__ == "__main__":
     assert not os.environ.get("XSOMA_ROBOT_DIR"), "run this test without XSOMA_ROBOT_DIR"
     test_term()
     test_commands()
     test_standin()
+    test_target()
     print("\nall checks passed")

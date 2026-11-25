@@ -35,7 +35,8 @@ weighs a penalty on the plain distance between the command and the base's veloci
 `--track_rel` takes that distance relative to the command's size. `--torque_limit` weighs a penalty on the PD torque that an
 imagined action asks for beyond `--torque_soft` x each joint's effort limit (task.torque_limit), in imagination only.
 `--range_penalty` weighs a penalty on the joints of `--range_joints name:lo:hi,...` outside those ranges (task.joint_range), in
-imagination only. Sixth and seventh entries of `--cmd_scale` scale a share of the commands down (slow commands).
+imagination only; `--range_target` weighs the same penalty on the PD targets that the imagined actions ask for. Sixth and
+seventh entries of `--cmd_scale` scale a share of the commands down (slow commands).
 `--touchdown_speed` weighs a penalty on a foot's downward speed lower than `--touchdown_height` over the terrain
 (task.touchdown_speed) and `--impact_accel` one on the base's upward acceleration (task.impact_accel), both in imagination only.
 `--turn_step` weighs a penalty, scaled by the yaw-rate command, on a foot that stands longer than `--turn_step_stance` seconds
@@ -174,8 +175,10 @@ class Config:
     torque_soft: float = 0.9  # with torque_limit: the share of the effort limit from which on the torque is penalized
     range_penalty: float = 0.0  # weight of the penalty task.joint_range on the joints of range_joints outside their ranges, in
     #                             imagination's reward only and weighted as feet_cross is (0: not computed)
-    range_joints: str = ""  # with range_penalty: "name:lo:hi,...": every joint whose name contains `name` is penalized outside
-    #                         [lo, hi] rad (e.g. limits that the robot's runtime enforces inside the model's joint ranges)
+    range_target: float = 0.0  # weight of the same penalty on the PD targets of the joints of range_joints (target spikes that the
+    #                            pose barely shows), in imagination's reward only and weighted as feet_cross is (0: not computed)
+    range_joints: str = ""  # with range_penalty or range_target: "name:lo:hi,...": every joint whose name contains `name` is
+    #                         penalized outside [lo, hi] rad (e.g. limits that the robot's runtime enforces inside the model's joint ranges)
     touchdown_speed: float = 0.0  # weight of the penalty task.touchdown_speed on a foot moving down while its lowest sole point is
     #                               less than touchdown_height over the terrain, in imagination's reward only and weighted as
     #                               feet_cross is (0: not computed)
@@ -291,7 +294,7 @@ class XSoma:
             self.ext = tuple(np.asarray(x, t) for x, t in zip(zip(*spec), (int, np.float32, np.float32)))
             self.ext_q0, self.ext_scale = (np.broadcast_to(x, (task.J,))[self.ext[0]] for x in (task.DEFAULT_Q, task.ACTION_SCALE))
         self.rng = None  # --range_joints: (the joints' indices, their lower and their upper bound in rad)
-        if c.range_penalty:
+        if c.range_penalty or c.range_target:
             spec = [(i, float(lo), float(hi)) for name, lo, hi in (e.split(":") for e in c.range_joints.split(",")) for i, d in enumerate(task.DOF) if name in d]
             assert spec and len({i for i, _, _ in spec}) == len(spec), f"--range_joints {c.range_joints}: no joint, or a joint twice"
             self.rng = tuple(np.asarray(x, t) for x, t in zip(zip(*spec), (int, np.float32, np.float32)))
@@ -596,6 +599,8 @@ class XSoma:
                 r = r - task.DT * c.torque_limit * scale * (x if ext is None else jnp.where(ext_j, 0.0, x)).sum(-1)
             if c.range_penalty:  # weighted as task.weighted weighs a penalty; the pose the step ends in
                 r = r - task.DT * c.range_penalty * scale * task.joint_range(v1.robot.q[:, self.rng[0]], *self.rng[1:]).sum(-1)
+            if c.range_target:  # weighted as task.weighted weighs a penalty; the PD target of the step's action
+                r = r - task.DT * c.range_target * scale * task.joint_range(target_q(tgt)[:, self.rng[0]], *self.rng[1:]).sum(-1)
             if c.touchdown_speed:  # weighted as task.weighted weighs a penalty; feet near the terrain at the step's end
                 dz = (v1.robot.foot_p - v.robot.foot_p)[..., 2]
                 r = r - task.DT * c.touchdown_speed * scale * task.touchdown_speed(self.sole_low(v1), dz, c.touchdown_height)
@@ -776,7 +781,8 @@ def main(argv=None):
     assert min(cfg.self_clearance, cfg.self_clearance_term) >= 0, "--self_clearance and --self_clearance_term are not negative"
     assert min(cfg.foot_clearance, cfg.foot_clearance_height, cfg.push_vel) >= 0, "--foot_clearance, --foot_clearance_height and --push_vel are not negative"
     assert not cfg.cmd_scale or len(cfg.cmd_scale.split(",")) in (3, 4, 5, 7), "--cmd_scale is three factors, for vx, vy and wz: 1,0.5,1 (a fourth: the share of zero commands, a fifth: of zero components, a sixth and seventh: the share of commands scaled and the factor)"
-    assert cfg.range_penalty >= 0 and bool(cfg.range_penalty) == bool(cfg.range_joints), "--range_penalty is not negative and goes with --range_joints"
+    assert min(cfg.range_penalty, cfg.range_target) >= 0 and bool(cfg.range_penalty or cfg.range_target) == bool(cfg.range_joints), \
+        "--range_penalty and --range_target are not negative, either goes with --range_joints"
     assert min(cfg.track_l1, cfg.stand_still) >= 0 and (not cfg.ext_blind or (cfg.ext_joints and cfg.init_tracker)), "--track_l1 is not negative, --ext_blind needs --ext_joints and --init_tracker"
     assert cfg.track_rel >= 0 and (cfg.track_l1 or not cfg.track_rel), "--track_rel is not negative and needs --track_l1"
     assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
