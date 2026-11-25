@@ -328,17 +328,15 @@ def walk_step(st, cmd, stance):
     return jnp.any(cmd != 0, -1) * jnp.maximum(0.0, st - stance).sum(-1)
 
 
-def balance(robot: Robot, sole_h, margin, height=TURN_STEP_HEIGHT):
+def balance(robot: Robot, margin):
     """The balance penalty term, which is not Holosoma's (train.py --balance): the squared horizontal distance (m) beyond
-    `margin` from the pelvis (a proxy of the center of mass) to its support: the segment between the contact points of both
-    feet when both stand (lowest sole point under `height` over the terrain, `sole_h` (N, 2)), the one standing foot's contact
-    point, nothing (zero) in flight. Keeps the weight over the feet instead of leaning toward the command."""
+    `margin` from the pelvis (a proxy of the center of mass) to the segment between the two feet's contact points, whether they
+    stand or swing: leaning ahead of (or behind, beside) both feet costs, and stepping a foot under the pelvis is what removes
+    it. (A single-stance support point would charge every step: the pelvis sits half a stance width beside the stance foot.)"""
     p, a, b = robot.p[:, :2], robot.foot_p[:, 0, :2], robot.foot_p[:, 1, :2]
     ab = b - a
     t = jnp.clip(jnp.sum((p - a) * ab, -1) / (jnp.sum(ab * ab, -1) + 1e-6), 0.0, 1.0)
-    dist = lambda x: jnp.sqrt(jnp.sum(jnp.square(p - x), -1) + 1e-12)  # noqa: E731
-    down = sole_h < height
-    d = jnp.where(down[:, 0] & down[:, 1], dist(a + t[:, None] * ab), jnp.where(down[:, 0], dist(a), jnp.where(down[:, 1], dist(b), 0.0)))
+    d = jnp.sqrt(jnp.sum(jnp.square(p - a - t[:, None] * ab), -1) + 1e-12)
     return jnp.square(jnp.maximum(0.0, d - margin))
 
 
