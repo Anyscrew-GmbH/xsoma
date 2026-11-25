@@ -321,6 +321,40 @@ def turn_step(st, wz, stance):
     return jnp.abs(wz) * jnp.maximum(0.0, st - stance).sum(-1)
 
 
+def walk_step(st, cmd, stance):
+    """The cadence penalty term, which is not Holosoma's (train.py --walk_step): under any nonzero planar or yaw command, the
+    seconds by which each foot's stance `st` (N, 2; turn_stance) exceeds `stance`, summed over the feet, whatever the command's
+    size: slow commands are walked in steps (a foot lifts at least every `stance` seconds), not by leaning. Standing is free."""
+    return jnp.any(cmd != 0, -1) * jnp.maximum(0.0, st - stance).sum(-1)
+
+
+def balance(robot: Robot, sole_h, margin, height=TURN_STEP_HEIGHT):
+    """The balance penalty term, which is not Holosoma's (train.py --balance): the squared horizontal distance (m) beyond
+    `margin` from the pelvis (a proxy of the center of mass) to its support: the segment between the contact points of both
+    feet when both stand (lowest sole point under `height` over the terrain, `sole_h` (N, 2)), the one standing foot's contact
+    point, nothing (zero) in flight. Keeps the weight over the feet instead of leaning toward the command."""
+    p, a, b = robot.p[:, :2], robot.foot_p[:, 0, :2], robot.foot_p[:, 1, :2]
+    ab = b - a
+    t = jnp.clip(jnp.sum((p - a) * ab, -1) / (jnp.sum(ab * ab, -1) + 1e-6), 0.0, 1.0)
+    dist = lambda x: jnp.sqrt(jnp.sum(jnp.square(p - x), -1) + 1e-12)  # noqa: E731
+    down = sole_h < height
+    d = jnp.where(down[:, 0] & down[:, 1], dist(a + t[:, None] * ab), jnp.where(down[:, 0], dist(a), jnp.where(down[:, 1], dist(b), 0.0)))
+    return jnp.square(jnp.maximum(0.0, d - margin))
+
+
+def step_length(robot: Robot, cmd, base, per_speed, width):
+    """The step-length penalty term, which is not Holosoma's (train.py --step_length): in the pelvis heading's frame, the squared
+    excess of the feet's fore-aft spread over base + per_speed x |vx command| and of their lateral spread over width + base +
+    per_speed x |vy command| (m; per_speed in s): small steps for slow commands, longer ones as the commanded speed rises."""
+    yaw = jnp.arctan2(robot.R[:, 1, 0], robot.R[:, 0, 0])
+    d = robot.feet_p[:, 0, :2] - robot.feet_p[:, 1, :2]
+    fx = jnp.cos(yaw) * d[:, 0] + jnp.sin(yaw) * d[:, 1]
+    fy = jnp.cos(yaw) * d[:, 1] - jnp.sin(yaw) * d[:, 0]
+    ex = jnp.maximum(0.0, jnp.abs(fx) - base - per_speed * jnp.abs(cmd[:, 0]))
+    ey = jnp.maximum(0.0, jnp.abs(fy) - width - base - per_speed * jnp.abs(cmd[:, 1]))
+    return jnp.square(ex) + jnp.square(ey)
+
+
 def impact_accel(v0, v1):
     """The impact penalty term, which is not Holosoma's (train.py --impact_accel): the square of the base's upward acceleration
     over one policy step in units of g, from its world velocities `v0`, `v1` (N, 3) at the step's start and end; zero while it

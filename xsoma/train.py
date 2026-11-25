@@ -184,6 +184,16 @@ class Config:
     #                         imagination's reward only and weighted as feet_cross is (0: not computed). Each imagined rollout starts
     #                         its stance clocks at zero (the replay buffer holds no contact history)
     turn_step_stance: float = 0.4  # s
+    walk_step: float = 0.0  # weight of the penalty task.walk_step (a foot's stance beyond turn_step_stance under any nonzero command),
+    #                         in imagination's reward only and weighted as feet_cross is (0: not computed)
+    balance: float = 0.0  # weight of the penalty task.balance (pelvis beyond balance_margin from the standing feet's support), in
+    #                       imagination's reward only and weighted as feet_cross is (0: not computed)
+    balance_margin: float = 0.03  # m
+    step_length: float = 0.0  # weight of the penalty task.step_length (feet spread beyond step_base + step_per_speed x |command|),
+    #                           in imagination's reward only and weighted as feet_cross is (0: not computed)
+    step_base: float = 0.10  # m
+    step_per_speed: float = 0.5  # s: the allowed spread grows by this times the commanded speed
+    step_width: float = 0.20  # m: the nominal lateral distance of the feet, not charged
     friction_surfaces: str = ""  # "lo:hi,lo:hi,...": per episode a surface uniformly, then the friction coefficient U[lo, hi] of it,
     #                              for every geom (the soles with sole_friction); "": task.FRICTION once per env (sim.SimCfg)
     joint_vel: float = 0.0  # weight of the penalty task.joint_vel, the sum of the squared joint speeds (rad/s) of the state an imagined
@@ -272,7 +282,7 @@ class XSoma:
                               support_gap=tuple(float(x) for x in c.support_gap.split(",")),
                               support_point=tuple(float(x) for x in c.support_point.split(",")) if c.support_point else None,
                               friction_surfaces=surfaces(c.friction_surfaces)))  # fmt: skip
-        if c.foot_clearance or c.touchdown_speed or c.turn_step:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
+        if c.foot_clearance or c.touchdown_speed or c.turn_step or c.walk_step or c.balance:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
             self.sole_foot = np.asarray(self.sim.sole_frame) == np.arange(2, 4)[:, None]
         self.ext = None  # --ext_joints: (the joints' indices, their lowest and their highest goal in rad)
         if c.ext_joints:
@@ -589,9 +599,14 @@ class XSoma:
             if c.touchdown_speed:  # weighted as task.weighted weighs a penalty; feet near the terrain at the step's end
                 dz = (v1.robot.foot_p - v.robot.foot_p)[..., 2]
                 r = r - task.DT * c.touchdown_speed * scale * task.touchdown_speed(self.sole_low(v1), dz, c.touchdown_height)
-            if c.turn_step:  # weighted as task.weighted weighs a penalty; the feet's heights in the imagined state
+            if c.turn_step or c.walk_step:  # weighted as task.weighted weighs a penalty; the feet's heights in the imagined state
                 st = task.turn_stance(st, self.sole_low(v1))
                 r = r - task.DT * c.turn_step * scale * task.turn_step(st, cmd[:, 2], c.turn_step_stance)
+                r = r - task.DT * c.walk_step * scale * task.walk_step(st, cmd, c.turn_step_stance)
+            if c.balance:  # weighted as task.weighted weighs a penalty; the state the step ends in
+                r = r - task.DT * c.balance * scale * task.balance(v1.robot, self.sole_low(v1), c.balance_margin)
+            if c.step_length:  # weighted as task.weighted weighs a penalty; the state the step ends in
+                r = r - task.DT * c.step_length * scale * task.step_length(v1.robot, cmd, c.step_base, c.step_per_speed, c.step_width)
             if c.joint_vel:  # weighted as task.weighted weighs a penalty; the joint speeds of the state the step ends in
                 r = r - task.DT * c.joint_vel * scale * task.joint_vel(v1.robot.qd if ext is None else jnp.where(ext_j, 0.0, v1.robot.qd))
             if c.impact_accel:  # weighted as task.weighted weighs a penalty; the world model's base velocities
@@ -768,6 +783,8 @@ def main(argv=None):
     assert min(cfg.touchdown_speed, cfg.touchdown_height, cfg.impact_accel) >= 0, "--touchdown_speed, --touchdown_height and --impact_accel are not negative"
     assert cfg.turn_step >= 0 and cfg.turn_step_stance > 0, "--turn_step is not negative, --turn_step_stance is positive"
     assert cfg.joint_vel >= 0, "--joint_vel is not negative"
+    assert min(cfg.walk_step, cfg.balance, cfg.balance_margin, cfg.step_length, cfg.step_base, cfg.step_per_speed, cfg.step_width) >= 0, \
+        "--walk_step, --balance, --balance_margin, --step_length, --step_base, --step_per_speed and --step_width are not negative"
     assert min(cfg.kl_bound, cfg.kl_beta, cfg.kl_beta_lr) >= 0 and (not cfg.kl_bound or (cfg.init_tracker and cfg.action_noise > 0)), \
         "--kl_bound, --kl_beta and --kl_beta_lr are not negative; --kl_bound needs --init_tracker and a positive --action_noise"
     surfaces(cfg.friction_surfaces)
