@@ -5,8 +5,8 @@ test_finetune's stand-in (run: python tests/test_kl_bound.py, or pytest). CPU on
   kl         imagination's KL, rebuilt from the recorded actions of the policy and of the initial tracker on the same inputs and
              the recorded terminations: the survival-weighted mean of |a - a0|^2 / (2 action_noise^2); zero at the initial
              tracker; the loss gains kl_beta x max(0, KL - eps), nothing for a bound above the KL
-  dual       a compiled policy update moves the weight by kl_beta_lr x (KL / eps - 1), never below zero, and keeps it with
-             kl_beta_lr 0; training's programs log kl, kl_term and kl_beta
+  dual       a compiled policy update moves the weight by kl_beta_lr x clip(KL / eps - 1, -1, 1), never below zero, not after a
+             step that the gradient gate skips, and keeps it with kl_beta_lr 0; training's programs log kl, kl_term and kl_beta
   joint_vel  without the option the term is not computed; with weight W the loss gains W x dt x penalty scale x the discounted sum
              of the squared joint speeds of each imagined step's end state
 """
@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import test_finetune as tf  # noqa: E402
 import test_impact  # noqa: E402
@@ -102,8 +103,12 @@ def check_dual(d):
         xs.init(jax.random.PRNGKey(0))  # sets the optimizer's masks
         carry = {**carry, "pi": moved(carry["pi"])}
         out, st = jax.jit(xs.policy_update)(carry, start, jax.random.PRNGKey(4))
-        want = max(0.0, beta + lr * (float(st["kl"]) / eps - 1))
+        want = max(0.0, beta + lr * min(1.0, float(st["kl"]) / eps - 1))
         assert np.isclose(float(st["kl_beta"]), beta) and np.isclose(float(out["kl_beta"]), want, rtol=1e-5), (float(out["kl_beta"]), want)
+        gated = rebuild(xs, pi_gn_gate=1.0)  # a step the gradient gate skips leaves the weight as it is
+        gated.init(jax.random.PRNGKey(0))
+        out, st = jax.jit(gated.policy_update)({**carry, "gn_ema": jnp.float32(1e-6)}, start, jax.random.PRNGKey(4))
+        assert float(st["gn_gated"]) == 1 and np.isclose(float(out["kl_beta"]), beta)
         far = rebuild(xs, kl_bound=1e3)  # KL far under the bound: the weight shrinks, not below zero
         far.init(jax.random.PRNGKey(0))
         out, st = jax.jit(far.policy_update)(carry, start, jax.random.PRNGKey(4))
@@ -116,7 +121,7 @@ def check_dual(d):
     carry, st2 = progs["pi"](carry)
     assert {"kl", "kl_term", "kl_beta", "anchor"} <= set(st2) and all(np.isfinite(float(v)) for v in st2.values())
     assert float(st1["kl"]) == 0 and float(st2["kl"]) > 0 and np.isclose(float(carry["kl_beta"]), beta)
-    print(f"dual: the weight moves by kl_beta_lr x (KL / eps - 1) up and down, not below zero, and stays without kl_beta_lr; training's programs "
+    print(f"dual: the weight moves by kl_beta_lr x clip(KL / eps - 1, -1, 1) up and down, not below zero, not after a gated step, and stays without kl_beta_lr; training's programs "
           f"log kl {float(st2['kl']):.2e} after one update, kl_term, kl_beta")
 
 

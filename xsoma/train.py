@@ -193,8 +193,9 @@ class Config:
     #                        exploration std action_noise, so KL = |a - a0|^2 / (2 action_noise^2), on the same inputs held constant
     #                        (as the anchor's); the loss gains kl_beta x max(0, KL - eps) (0: off)
     kl_beta: float = 1.0  # with kl_bound: the weight of that term (its starting value with kl_beta_lr)
-    kl_beta_lr: float = 0.0  # with kl_bound, > 0: dual ascent on the weight after every policy update, kl_beta <- max(0, kl_beta +
-    #                          kl_beta_lr x (KL / eps - 1)): it grows while KL is above the bound and shrinks below it (0: fixed weight)
+    kl_beta_lr: float = 0.0  # with kl_bound, > 0: dual ascent on the weight after every accepted policy update, kl_beta <- max(0,
+    #                          kl_beta + kl_beta_lr x clip(KL / eps - 1, -1, 1)): it grows while KL is above the bound and shrinks below
+    #                          it, by at most kl_beta_lr per update (0: fixed weight)
     impact_accel: float = 0.0  # weight of the penalty task.impact_accel on the base's upward acceleration over a step (a proxy of
     #                            the ground force's peaks), in imagination's reward only and weighted as feet_cross is (0: not computed)
     support: float = 0.0  # share of the episodes that start with the robot on a rope that pulls its torso up (sim.Sim._support,
@@ -658,8 +659,10 @@ class XSoma:
         avg = optim.ema(carry["avg"], pi, c.pi_ema, carry["it"] == c.wm_only_iters)
         stats = {**aux, "gn": gn, "gn_gated": (finite & ~ok).astype(jnp.float32)}
         out = {"pi": pi, "opt_pi": opt_pi, "avg": avg, "gn_ema": gn_ema, "nonfinite": carry["nonfinite"] + (~finite).astype(jnp.int32)}
-        if "kl_beta" in carry:  # dual ascent on the KL term's weight, from the KL before this step (stats: the weight it was taken with)
-            out["kl_beta"] = jnp.maximum(0.0, carry["kl_beta"] + c.kl_beta_lr * (aux["kl"] / c.kl_bound - 1.0))
+        if "kl_beta" in carry:  # dual ascent on the KL term's weight, from the KL before this step (stats: the weight it was taken with).
+            # Only after an accepted step: a weight that kept growing while the gate skips the steps it causes would lock the gate
+            step = c.kl_beta_lr * jnp.clip(aux["kl"] / c.kl_bound - 1.0, -1.0, 1.0)
+            out["kl_beta"] = jnp.where(ok, jnp.maximum(0.0, carry["kl_beta"] + step), carry["kl_beta"])
             stats["kl_beta"] = carry["kl_beta"]
         return out, stats
 
