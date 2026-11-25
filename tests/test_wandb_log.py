@@ -97,7 +97,11 @@ def test_wandb_log():
     train_logs, eval_logs = fake.logged[: len(recs)], fake.logged[len(recs) :]
     assert [s for s, _ in train_logs] == [r["it"] for r in recs] and evals and len(eval_logs) == len(evals)
     for (_, sent), rec in zip(train_logs, recs):
-        assert sent == {k: v for k, v in rec.items() if isinstance(v, (int, float))} and "wm" in sent and "rew_tracking_lin_vel" in sent
+        nums = {k: v for k, v in rec.items() if isinstance(v, (int, float))}  # each in one section, the overview ones twice
+        own = {k.split("/", 1)[1]: v for k, v in sent.items() if not k.startswith("overview/") and k != "metrics/steps_per_s"}
+        assert own == nums and len(own) == len(sent) - sum(k.startswith("overview/") for k in sent) - ("metrics/steps_per_s" in sent), sent
+        assert sent["world_model/wm"] == nums["wm"] and "rewards/rew_tracking_lin_vel" in sent and sent["overview/reward"] == nums["reward"]
+        assert "actor/G" in sent and "metrics/it" in sent and "overview/ep_len" in sent
     for (step, sent), rec in zip(eval_logs, evals):
         assert step is None and sent == {"eval/" + k: v for k, v in rec.items() if isinstance(v, (int, float))} and "eval/success" in sent
         assert not any(isinstance(v, str) for v in sent.values()) and "eval/ckpt" not in sent
@@ -105,7 +109,7 @@ def test_wandb_log():
 
     config = kw["config"]
     names_file = lambda s: wandb_log.PATH_KEY.search(s) or wandb_log.PATH_VALUE.search(s)  # noqa: E731
-    assert not any(names_file(k) or (isinstance(v, str) and names_file(v)) for k, v in config.items()), config
+    assert not any((names_file(k) and not isinstance(v, (int, float))) or (isinstance(v, str) and names_file(v)) for k, v in config.items()), config  # numbers kept (mirror_clips)
     assert not {"robot_dir", "init_tracker", "tracker_meta", "log_dir", "jax_cache"} & set(config) and not any(k.startswith("wandb") for k in config)
     assert {"pi_lr", "pi_clip", "horizon", "num_envs", "support_gap", "seed"} <= set(config) and config["num_envs"] == tf.N
     paths = {"robot_dir": "robots/x", "init_tracker": "a.npz", "tracker_meta": "m.json", "notes": "~/x", "home": "C:\\runs", "pi_lr": 1e-3}

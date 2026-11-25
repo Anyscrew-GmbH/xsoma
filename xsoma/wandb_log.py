@@ -19,7 +19,8 @@ _run = None
 def hparams(config: dict) -> dict:
     """`config` without the entries whose key or value names a file or directory, and without the wandb options."""
     return {k: v for k, v in config.items()
-            if not k.startswith("wandb_") and not PATH_KEY.search(k) and not (isinstance(v, str) and PATH_VALUE.search(v))}  # fmt: skip
+            if not k.startswith("wandb_") and (isinstance(v, (int, float)) or not PATH_KEY.search(k))  # a number never names a file
+            and not (isinstance(v, str) and PATH_VALUE.search(v))}  # fmt: skip
 
 
 def start(config: dict, log_dir: str):
@@ -48,12 +49,46 @@ def start(config: dict, log_dir: str):
     _run = None
 
 
+# W&B sections: overview/ (is it learning to walk), rewards/ (the environment's reward and its terms), actor/ (policy loss,
+# gradients, KL), critic/ (value), world_model/ (model losses and errors), metrics/ (speed, steps, learning rates, health).
+# A key not listed: rew_* -> rewards/, else metrics/. Overview keys are also logged in their own section.
+OVERVIEW = {"reward", "ep_len", "avg_len", "surv", "term_env", "rew_tracking_lin_vel", "rew_tracking_ang_vel",  # fine-tuning
+            "ep_ret", "sim_r", "term_frac"}  # imitation
+GROUPS = {"rewards": {"reward", "r", "sim_r", "ir", "ep_ret"},
+          "actor": {"G", "pi", "pi_lr", "gn", "gn_gated", "scale", "kl", "kl_term", "kl_beta", "support"},
+          "critic": {"v", "q"},
+          "world_model": {"wm", "wm8", "wm_gated", "h_err8", "h_errK", "term_wm", "diverged", "anchor"}}
+_last = None  # (wall seconds, steps) of the previous record, for steps per second
+
+
+def sections(record: dict) -> dict:
+    """{section/key: number} for a training record, plus metrics/steps_per_s from the previous record."""
+    global _last
+    out = {}
+    for k, v in record.items():
+        if not isinstance(v, (int, float)):
+            continue
+        g = next((g for g, ks in GROUPS.items() if k in ks), "rewards" if k.startswith("rew_") else "metrics")
+        out[f"{g}/{k}"] = v
+        if k in OVERVIEW:
+            out[f"overview/{k}"] = v
+    wall = record.get("wall_s", 60.0 * record["wall_min"] if isinstance(record.get("wall_min"), (int, float)) else None)
+    steps = record.get("env_steps", record.get("sim_steps"))
+    if isinstance(wall, (int, float)) and isinstance(steps, (int, float)):
+        if _last is not None and wall > _last[0]:
+            out["metrics/steps_per_s"] = (steps - _last[1]) / (wall - _last[0])
+        _last = (wall, steps)
+    return out
+
+
 def log(record: dict, step=None, prefix=""):
-    """The record's numbers (no strings, lists or None), if a run was started."""
+    """The record's numbers (no strings, lists or None), if a run was started: training records in their sections (see
+    GROUPS), records with a prefix (evaluation: "eval/") under it as they are."""
     global _run
     if _run is not None:
         try:
-            _run.log({prefix + k: v for k, v in record.items() if isinstance(v, (int, float))}, step=step)
+            nums = {prefix + k: v for k, v in record.items() if isinstance(v, (int, float))} if prefix else sections(record)
+            _run.log(nums, step=step)
         except Exception as e:  # noqa: BLE001
             print(f"[wandb] warning: logging stopped: {e!r}", flush=True)
             _run = None
