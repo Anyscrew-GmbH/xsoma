@@ -41,6 +41,10 @@ imagination only. Sixth and seventh entries of `--cmd_scale` scale a share of th
 `--turn_step` weighs a penalty, scaled by the yaw-rate command, on a foot that stands longer than `--turn_step_stance` seconds
 (task.turn_step; stance from the feet's heights in the imagined states), in imagination only. `--friction_surfaces lo:hi,...`
 draws each episode's friction coefficient from a surface picked uniformly, then uniformly in its range (sim.Sim._mu).
+`--joint_vel` weighs a penalty on the squared joint speeds of the imagined states (task.joint_vel), in imagination only. With a
+tracker policy, `--kl_bound <eps>` keeps the trained policy near the initial one: the loss gains kl_beta x max(0, KL - eps), KL
+being that between the two policies' action distributions on the imagined states, and with `--kl_beta_lr` the weight adapts
+by dual ascent (XSoma.imagine, XSoma.policy_update).
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -182,6 +186,15 @@ class Config:
     turn_step_stance: float = 0.4  # s
     friction_surfaces: str = ""  # "lo:hi,lo:hi,...": per episode a surface uniformly, then the friction coefficient U[lo, hi] of it,
     #                              for every geom (the soles with sole_friction); "": task.FRICTION once per env (sim.SimCfg)
+    joint_vel: float = 0.0  # weight of the penalty task.joint_vel, the sum of the squared joint speeds (rad/s) of the state an imagined
+    #                         step ends in, in imagination's reward only and weighted as feet_cross is (0: not computed)
+    kl_bound: float = 0.0  # with init_tracker, > 0: the bound eps on KL, the mean over the imagined states of the KL divergence between
+    #                        the policy's action distribution and the initial tracker's, both Gaussians around their actions with the
+    #                        exploration std action_noise, so KL = |a - a0|^2 / (2 action_noise^2), on the same inputs held constant
+    #                        (as the anchor's); the loss gains kl_beta x max(0, KL - eps) (0: off)
+    kl_beta: float = 1.0  # with kl_bound: the weight of that term (its starting value with kl_beta_lr)
+    kl_beta_lr: float = 0.0  # with kl_bound, > 0: dual ascent on the weight after every policy update, kl_beta <- max(0, kl_beta +
+    #                          kl_beta_lr x (KL / eps - 1)): it grows while KL is above the bound and shrinks below it (0: fixed weight)
     impact_accel: float = 0.0  # weight of the penalty task.impact_accel on the base's upward acceleration over a step (a proxy of
     #                            the ground force's peaks), in imagination's reward only and weighted as feet_cross is (0: not computed)
     support: float = 0.0  # share of the episodes that start with the robot on a rope that pulls its torso up (sim.Sim._support,
@@ -305,7 +318,9 @@ class XSoma:
             pi = {"enc": tr["enc"], "dec": tr["dec"]}
             self.frozen = {k: v for k, v in tr.items() if k not in pi}  # constants of the programs, never trained
             # mem: the tracker's memory in collection; pi0: the initial tracker, the anchor's reference
-            extra = {"mem": tracker.memory(tr, c.num_envs), **({"pi0": jax.tree.map(jnp.copy, pi)} if c.anchor > 0 else {})}
+            extra = {"mem": tracker.memory(tr, c.num_envs), **({"pi0": jax.tree.map(jnp.copy, pi)} if c.anchor > 0 or c.kl_bound > 0 else {})}
+            if c.kl_bound > 0:  # the KL term's weight, adapted with kl_beta_lr
+                extra["kl_beta"] = jnp.float32(c.kl_beta)
             self.H = extra["mem"]["hist"].shape[1]
             assert min(c.warmup_steps, c.buffer_steps) >= self.H, f"a start needs {self.H} collected steps for the tracker's history"
             rec_t["heading"] = jax.ShapeDtypeStruct((c.num_envs,), jnp.float32)
@@ -498,13 +513,15 @@ class XSoma:
         """(N, 2) each foot's lowest sole point over the terrain in the view `v`."""
         return jnp.where(self.sole_foot, v.soles[..., None, :], jnp.inf).min(-1)
 
-    def imagine(self, pi, wm, wm_b, start, keys, scale, heights, pi0=None):
+    def imagine(self, pi, wm, wm_b, start, keys, scale, heights, pi0=None, kl_beta=None):
         """The loss of the policy update: the negative mean discounted return of `horizon` imagined steps from `start`. A step
         follows the task's order: the policy acts on the observation, the world model moves the robot, the reward and the
         termination are read on the new state, then the gait phase advances and the command resamples every 500 steps. A tracker
         policy (`pi`: its encoder and decoder) acts as in tracker.step, on its noisy observation of the imagined state, the
         history and the commanded heading; with `pi0`, the initial tracker, the loss gains `anchor` times the mean squared distance
-        between the two policies' actions on the same inputs (held constant for it), over the steps that count for the return."""
+        between the two policies' actions on the same inputs (held constant for it), over the steps that count for the return, and
+        with `kl_beta` (--kl_bound) kl_beta x max(0, KL - kl_bound), KL being that distance's mean over the same steps (weighted by
+        their survival, held constant) over 2 action_noise^2: the KL divergence of two Gaussians of that std around the actions."""
         c, B = self.cfg, self.cfg.pi_batch
         bf16 = c.mm_bf16 in ("imag", "all")
         rcfg = self.reward_cfg
@@ -574,6 +591,8 @@ class XSoma:
             if c.turn_step:  # weighted as task.weighted weighs a penalty; the feet's heights in the imagined state
                 st = task.turn_stance(st, self.sole_low(v1))
                 r = r - task.DT * c.turn_step * scale * task.turn_step(st, cmd[:, 2], c.turn_step_stance)
+            if c.joint_vel:  # weighted as task.weighted weighs a penalty; the joint speeds of the state the step ends in
+                r = r - task.DT * c.joint_vel * scale * task.joint_vel(v1.robot.qd if ext is None else jnp.where(ext_j, 0.0, v1.robot.qd))
             if c.impact_accel:  # weighted as task.weighted weighs a penalty; the world model's base velocities
                 r = r - task.DT * c.impact_accel * scale * task.impact_accel(v.robot.v, v1.robot.v)
             d = self.termination(v1.clearance)
@@ -612,6 +631,11 @@ class XSoma:
         if pen is not None:
             anchor = (alive_before * pen).mean()
             loss, stats = loss + c.anchor * anchor, {**stats, "anchor": anchor}
+        if kl_beta is not None:
+            w = jax.lax.stop_gradient(alive_before)
+            kl = (w * pen).sum() / jnp.maximum(w.sum(), 1.0) / (2 * c.action_noise**2)
+            kl_term = kl_beta * jnp.maximum(0.0, kl - c.kl_bound)
+            loss, stats = loss + kl_term, {**stats, "kl": kl, "kl_term": kl_term}
         return loss, stats
 
     def policy_update(self, carry, start, key):
@@ -620,7 +644,8 @@ class XSoma:
         c = self.cfg
         env = carry["env"]
         (_, aux), grads = jax.value_and_grad(self.imagine, has_aux=True)(carry["pi"], carry["wm"], carry["wm_b"], start, jax.random.split(key, c.horizon),
-                                                                         env.scale, env.world.heights, **({"pi0": carry["pi0"]} if "pi0" in carry else {}))  # fmt: skip
+                                                                         env.scale, env.world.heights, **({"pi0": carry["pi0"]} if "pi0" in carry else {}),
+                                                                         **({"kl_beta": carry["kl_beta"]} if "kl_beta" in carry else {}))  # fmt: skip
         grads, gn = optim.clip_by_global_norm(grads, c.pi_clip)  # gn is the norm before clipping
         finite = jnp.isfinite(gn)
         first = carry["gn_ema"] <= 0
@@ -632,7 +657,11 @@ class XSoma:
         # the averaged policy is a copy of the policy at the first policy update, then follows it as an exponential moving average
         avg = optim.ema(carry["avg"], pi, c.pi_ema, carry["it"] == c.wm_only_iters)
         stats = {**aux, "gn": gn, "gn_gated": (finite & ~ok).astype(jnp.float32)}
-        return {"pi": pi, "opt_pi": opt_pi, "avg": avg, "gn_ema": gn_ema, "nonfinite": carry["nonfinite"] + (~finite).astype(jnp.int32)}, stats
+        out = {"pi": pi, "opt_pi": opt_pi, "avg": avg, "gn_ema": gn_ema, "nonfinite": carry["nonfinite"] + (~finite).astype(jnp.int32)}
+        if "kl_beta" in carry:  # dual ascent on the KL term's weight, from the KL before this step (stats: the weight it was taken with)
+            out["kl_beta"] = jnp.maximum(0.0, carry["kl_beta"] + c.kl_beta_lr * (aux["kl"] / c.kl_bound - 1.0))
+            stats["kl_beta"] = carry["kl_beta"]
+        return out, stats
 
     # ------------------------------------------------------------------ iteration programs
     def collect_iter(self, carry):
@@ -658,7 +687,7 @@ class XSoma:
         """pi_updates policy updates (after wm_only_iters iterations, while the world model is healthy)."""
         c = self.cfg
         key, k_p = jax.random.split(carry["key"])
-        names = ("pi", "opt_pi", "avg", "gn_ema", "nonfinite")
+        names = ("pi", "opt_pi", "avg", "gn_ema", "nonfinite") + (("kl_beta",) if "kl_beta" in carry else ())
 
         def one(sub, k):
             k_s, k_u = jax.random.split(k)
@@ -669,7 +698,9 @@ class XSoma:
             return sub, jax.tree.map(jnp.mean, st)
 
         def skip(sub):
-            return sub, {k: jnp.zeros((), jnp.float32) for k in ("G", "r", "surv", "gn", "gn_gated") + (("anchor",) if "pi0" in carry else ())}
+            kl = ("kl", "kl_term") if "kl_beta" in carry else ()
+            st = {k: jnp.zeros((), jnp.float32) for k in ("G", "r", "surv", "gn", "gn_gated") + (("anchor",) if "pi0" in carry else ()) + kl}
+            return sub, {**st, **({"kl_beta": sub["kl_beta"]} if kl else {})}
 
         active = carry["it"] >= c.wm_only_iters
         sub, pstats = jax.lax.cond(active & carry["wm_ok"], do, skip, {k: carry[k] for k in names})
@@ -733,6 +764,9 @@ def main(argv=None):
     assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
     assert min(cfg.touchdown_speed, cfg.touchdown_height, cfg.impact_accel) >= 0, "--touchdown_speed, --touchdown_height and --impact_accel are not negative"
     assert cfg.turn_step >= 0 and cfg.turn_step_stance > 0, "--turn_step is not negative, --turn_step_stance is positive"
+    assert cfg.joint_vel >= 0, "--joint_vel is not negative"
+    assert min(cfg.kl_bound, cfg.kl_beta, cfg.kl_beta_lr) >= 0 and (not cfg.kl_bound or (cfg.init_tracker and cfg.action_noise > 0)), \
+        "--kl_bound, --kl_beta and --kl_beta_lr are not negative; --kl_bound needs --init_tracker and a positive --action_noise"
     surfaces(cfg.friction_surfaces)
     gap = [float(x) for x in cfg.support_gap.split(",")]
     assert 0 <= cfg.support <= 1 and len(gap) == 2 and gap[0] <= gap[1], "--support is a share, --support_gap is lo,hi in m"

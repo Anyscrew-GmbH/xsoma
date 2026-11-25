@@ -292,6 +292,12 @@ def joint_range(q, lo, hi):
     return jnp.maximum(0.0, q - hi) + jnp.maximum(0.0, lo - q)
 
 
+def joint_vel(qd):
+    """The joint-speed penalty term, which is not Holosoma's (train.py --joint_vel): the sum over the joints of the squared joint
+    speeds (rad/s)^2, (N, J) -> (N,)."""
+    return jnp.sum(jnp.square(qd), -1)
+
+
 def touchdown_speed(sole_h, feet_dz, height=TOUCHDOWN_HEIGHT):
     """The touchdown-speed penalty term, which is not Holosoma's (train.py --touchdown_speed): per foot whose lowest sole point
     ends the step less than `height` over the terrain (`sole_h`, (N, 2)), the square of its downward speed (m/s), from the
