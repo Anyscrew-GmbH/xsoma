@@ -47,6 +47,8 @@ tracker policy, `--kl_bound <eps>` keeps the trained policy near the initial one
 being that between the two policies' action distributions on the imagined states, and with `--kl_beta_lr` the weight adapts
 by dual ascent (XSoma.imagine, XSoma.policy_update). With a tracker policy, `--symmetry` weighs the squared distance between the
 action for the left/right mirror image of an imagined state and the mirror image of the action for that state (tracker.mirror).
+`--upper_tilt` weighs a penalty on the sideways tilt in the world of the body `--upper_body` (task.upper_tilt) and `--upper_rate` one
+on the rate of that tilt (task.upper_rate), both in imagination only, the body's pose by forward kinematics of the imagined states.
 `--start_share` starts a share of the episodes in another joint pose (`--start_joints name:lo:hi,...`, offsets from the default
 pose) and, with `--start_cmd`, with a command from given ranges (sim.Sim._fresh).
 
@@ -71,6 +73,7 @@ import numpy as np
 
 from . import buffer as rb
 from . import nets, optim, task, tracker, wandb_log
+from .kin import Kinematics
 from .sim import Sim, SimCfg, surfaces, unflatten
 
 
@@ -221,6 +224,11 @@ class Config:
     #                         position + U[lo, hi] rad (e.g. a stance a robot ends in after a particular start), the others as usual
     start_cmd: str = ""  # with start_share: "lo:hi,lo:hi,lo:hi": those episodes' first command (vx, vy, wz) uniform in these ranges
     #                      ("": drawn as any other)
+    upper_body: str = ""  # with upper_tilt or upper_rate: the name of a body above the pelvis (e.g. the chest) in the robot's MJCF
+    upper_tilt: float = 0.0  # weight of the penalty task.upper_tilt (the squared sine of upper_body's sideways tilt in the world, in the
+    #                          pelvis heading's frame), in imagination's reward only and weighted as feet_cross is (0: not computed)
+    upper_rate: float = 0.0  # weight of the penalty task.upper_rate (the squared rate of that tilt over a policy step, 1/s), in
+    #                          imagination's reward only and weighted as feet_cross is (0: not computed)
     impact_accel: float = 0.0  # weight of the penalty task.impact_accel on the base's upward acceleration over a step (a proxy of
     #                            the ground force's peaks), in imagination's reward only and weighted as feet_cross is (0: not computed)
     support: float = 0.0  # share of the episodes that start with the robot on a rope that pulls its torso up (sim.Sim._support,
@@ -307,6 +315,7 @@ class XSoma:
             self.ext = tuple(np.asarray(x, t) for x, t in zip(zip(*spec), (int, np.float32, np.float32)))
             self.ext_q0, self.ext_scale = (np.broadcast_to(x, (task.J,))[self.ext[0]] for x in (task.DEFAULT_Q, task.ACTION_SCALE))
         self.rng = self.joint_ranges(c.range_joints) if c.range_penalty or c.range_target else None  # --range_joints
+        self.upper = Kinematics(self.sim.m, [f"robot_{c.upper_body}"]) if c.upper_tilt or c.upper_rate else None  # --upper_body
         self.mirror = tracker.mirror(c.tracker_meta) if c.symmetry else None  # --symmetry: (perm, sign) of the tracker's joints
         self.reward_cfg = self.sim.reward_cfg if c.gait_clock else dataclasses.replace(self.sim.reward_cfg, feet_phase=0.0)  # imagination's reward
         self.ckpt_extra = None  # a tracker policy: what save_ckpt writes besides the networks, the normalizers and the metadata as loaded
@@ -319,6 +328,10 @@ class XSoma:
         J = self.J
         # error floors of the world-model loss for every state dimension: ERR_FLOOR's four groups, then q and qd
         self.err_floor = np.concatenate([np.full((n,), v, np.float32) for n, v in ERR_FLOOR] + [np.full((J,), 3e-3, np.float32), np.full((J,), 5e-2, np.float32)])
+
+    def upper_R(self, robot):
+        """The world rotation (N, 3, 3) of --upper_body in a state of the task's view, by forward kinematics."""
+        return self.upper.forward(robot.p, robot.R, robot.q)[1][..., 0, :, :]
 
     @staticmethod
     def joint_ranges(spec_s):
@@ -639,6 +652,10 @@ class XSoma:
                 r = r - task.DT * c.step_length * scale * task.step_length(v1.robot, cmd, c.step_base, c.step_per_speed, c.step_width)
             if c.joint_vel:  # weighted as task.weighted weighs a penalty; the joint speeds of the state the step ends in
                 r = r - task.DT * c.joint_vel * scale * task.joint_vel(v1.robot.qd if ext is None else jnp.where(ext_j, 0.0, v1.robot.qd))
+            if c.upper_tilt:  # weighted as task.weighted weighs a penalty; the state the step ends in
+                r = r - task.DT * c.upper_tilt * scale * task.upper_tilt(self.upper_R(v1.robot), v1.robot.R)
+            if c.upper_rate:  # weighted as task.weighted weighs a penalty; the step's start and end states
+                r = r - task.DT * c.upper_rate * scale * task.upper_rate(self.upper_R(v.robot), v.robot.R, self.upper_R(v1.robot), v1.robot.R)
             if c.impact_accel:  # weighted as task.weighted weighs a penalty; the world model's base velocities
                 r = r - task.DT * c.impact_accel * scale * task.impact_accel(v.robot.v, v1.robot.v)
             d = self.termination(v1.clearance)
@@ -821,6 +838,8 @@ def main(argv=None):
         "--walk_step, --balance, --balance_margin, --step_length, --step_base, --step_per_speed and --step_width are not negative"
     assert min(cfg.kl_bound, cfg.kl_beta, cfg.kl_beta_lr) >= 0 and (not cfg.kl_bound or (cfg.init_tracker and cfg.action_noise > 0)), \
         "--kl_bound, --kl_beta and --kl_beta_lr are not negative; --kl_bound needs --init_tracker and a positive --action_noise"
+    assert min(cfg.upper_tilt, cfg.upper_rate) >= 0 and (not (cfg.upper_tilt or cfg.upper_rate) or cfg.upper_body), \
+        "--upper_tilt and --upper_rate are not negative and need --upper_body"
     assert cfg.symmetry >= 0 and (cfg.init_tracker or not cfg.symmetry), "--symmetry is not negative and needs --init_tracker"
     assert 0 <= cfg.start_share <= 1 and bool(cfg.start_share) == bool(cfg.start_joints) and (cfg.start_share or not cfg.start_cmd), \
         "--start_share is a share and goes with --start_joints, --start_cmd needs them"

@@ -353,6 +353,26 @@ def step_length(robot: Robot, cmd, base, per_speed, width):
     return jnp.square(ex) + jnp.square(ey)
 
 
+def lateral_tilt(Rb, R):
+    """The sine of a body's sideways tilt: its up axis (the third column of its rotation `Rb`, (N, 3, 3)) along the lateral axis of
+    the pelvis heading (from the pelvis rotation `R`), + toward the left. (N,)"""
+    yaw = jnp.arctan2(R[:, 1, 0], R[:, 0, 0])
+    return jnp.cos(yaw) * Rb[:, 1, 2] - jnp.sin(yaw) * Rb[:, 0, 2]
+
+
+def upper_tilt(Rb, R):
+    """The upper-body tilt penalty term, which is not Holosoma's (train.py --upper_tilt): the square of lateral_tilt of a body above
+    the pelvis (e.g. the chest), in the world: a sideways lean of that body, whatever the joints below it do."""
+    return jnp.square(lateral_tilt(Rb, R))
+
+
+def upper_rate(Rb0, R0, Rb1, R1):
+    """The upper-body sway penalty term, which is not Holosoma's (train.py --upper_rate): the square of the rate (1/s) at which
+    lateral_tilt of that body changes over one policy step, from its rotations at the step's start (`Rb0`, pelvis `R0`) and end:
+    swinging it from side to side costs, a steady lean does not."""
+    return jnp.square((lateral_tilt(Rb1, R1) - lateral_tilt(Rb0, R0)) / DT)
+
+
 def impact_accel(v0, v1):
     """The impact penalty term, which is not Holosoma's (train.py --impact_accel): the square of the base's upward acceleration
     over one policy step in units of g, from its world velocities `v0`, `v1` (N, 3) at the step's start and end; zero while it
