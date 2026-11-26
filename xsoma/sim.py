@@ -74,6 +74,9 @@ class SimCfg:
     seed: int = 42  # terrain layout and env origins; the start-up randomization uses the key passed to init
     friction_surfaces: tuple = ()  # ((lo, hi), ...): each episode draws a surface uniformly, then the friction coefficient
     #                                uniformly in its range (Sim._mu); (): task.FRICTION's buckets once per env at start-up
+    start_share: float = 0.0  # share of the fresh episodes that start in the pose of start_joints (Sim._fresh; episodes on the rope keep its pose)
+    start_joints: tuple | None = None  # ((joint index, lo, hi), ...): those joints start at their default position + U[lo, hi]
+    start_cmd: tuple | None = None  # ((lo, hi) of vx, vy, wz): those episodes' command; None: drawn as any other
 
 
 def surfaces(spec):
@@ -489,6 +492,15 @@ class Sim:
         kd = jax.random.uniform(k[4], (N, J), minval=task.GAIN_SCALE[0], maxval=task.GAIN_SCALE[1])
         delay = jax.random.randint(k[5], (N,), 0, task.MAX_DELAY + 1)
         cmd, freq = task.sample_commands(k[6], N, self.cfg.cmd_scale)
+        if self.cfg.start_share:  # SimCfg.start_share: another starting pose, and command, for a share of the episodes
+            k_on, k_q, k_c = jax.random.split(jax.random.fold_in(key, 9), 3)
+            on = (jax.random.uniform(k_on, (N,)) < self.cfg.start_share)[:, None]
+            i, lo, hi = (np.asarray(x) for x in zip(*self.cfg.start_joints))
+            q_s = np.broadcast_to(task.DEFAULT_Q, (J,))[i] + jax.random.uniform(k_q, (N, len(i)), minval=lo, maxval=hi)
+            qpos = qpos.at[:, 7 + i].set(jnp.where(on, q_s, qpos[:, 7 + i]))
+            if self.cfg.start_cmd:
+                lo, hi = np.asarray(self.cfg.start_cmd, np.float32).T
+                cmd = jnp.where(on, jax.random.uniform(k_c, (N, 3), minval=lo, maxval=hi), cmd)
         return qpos, qvel, kp, kd, delay, cmd, freq, task.sample_phase_offsets(k[7], N), self._push_interval(k[8])
 
     def _push_interval(self, key):

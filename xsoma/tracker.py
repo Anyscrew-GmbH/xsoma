@@ -114,6 +114,43 @@ def act(p, hist, g, out_bf16=False):
     return nets.mlp_apply(p["dec"], jnp.concatenate((z, o), -1), jax.nn.elu, out_bf16=out_bf16) + (g[..., FRAME : FRAME + J] - p["q0"]) / p["alpha"]
 
 
+# the sagittal mirror M = diag(1, -1, 1) of the observation's base blocks: the angular velocity is a pseudo-vector (-M w), gravity
+# a vector (M g), the relative rotation X becomes M X M (its first two columns, row-major as rot.mat_to_6d); and of a command
+MIRROR_W, MIRROR_G, MIRROR_REL = np.float32([-1, 1, -1]), np.float32([1, -1, 1]), np.float32([1, -1, -1, 1, 1, -1])
+MIRROR_CMD = np.float32([1, -1, -1])  # v x, v y, w z
+
+
+def mirror(meta):
+    """The left/right mirror image of the tracker's joints (its order) from its robot description (`kin_joint_idx`, `kin_axes`, as
+    XMimic's algorithm.Mirror reads them): (perm, sign), joint i of the mirror image = sign[i] x joint perm[i]. A joint `left_*`
+    pairs with `right_*`, any other with itself. A rotation about the axis a mirrors to one about -M a, so the sign is -(a_partner .
+    M a). The default pose and the action scale must be their own mirror images, so that mirroring q - q0 and the actions is exact."""
+    with open(meta) as f:
+        meta = json.load(f)
+    names = list(meta["joint_names"])
+    axis = {names[j]: np.asarray(a) for j, a in zip(meta["kin_joint_idx"], meta["kin_axes"]) if j >= 0}
+    swap = lambda n: n.replace("left_", "@").replace("right_", "left_").replace("@", "right_")  # noqa: E731
+    perm = np.asarray([names.index(swap(n)) for n in names])
+    s = np.asarray([-float(axis[names[p]] @ (axis[n] * [1.0, -1.0, 1.0])) for n, p in zip(names, perm)])
+    assert np.allclose(np.abs(s), 1, atol=1e-4), f"joints whose partner is not their mirror image: {[n for n, x in zip(names, s) if abs(abs(x) - 1) > 1e-4]}"
+    sign = np.sign(s).astype(np.float32)
+    for what in ("default_joint_pos", "action_scale"):
+        x = np.asarray(meta[what], np.float32)
+        x_m = x[perm] if what == "action_scale" else x[perm] * sign
+        assert np.allclose(x_m, x, atol=1e-5), f"the {what} is not its own mirror image"
+    return perm, sign
+
+
+def mirror_obs(m, o):
+    """The observation (..., 3 J + 12; also a history of them) of the mirror image of the robot, `m` = mirror(meta): the joint blocks
+    (q - q0, qd, previous action) swapped with their signs, the base blocks as MIRROR_W, MIRROR_G, MIRROR_REL."""
+    perm, sign = m
+    J = len(perm)
+    j = lambda x: x[..., perm] * sign  # noqa: E731
+    return jnp.concatenate((j(o[..., :J]), j(o[..., J : 2 * J]), o[..., 2 * J : 2 * J + 3] * MIRROR_W, o[..., 2 * J + 3 : 2 * J + 6] * MIRROR_G,
+                            j(o[..., 2 * J + 6 : 3 * J + 6]), o[..., 3 * J + 6 :] * MIRROR_REL), -1)  # fmt: skip
+
+
 def memory(p, n):
     """What the tracker carries through an episode, for n envs: the observation history, the commanded heading and the episode
     counter of its last step. The initial counter is above any episode's, so `step` starts every env anew."""

@@ -45,7 +45,10 @@ draws each episode's friction coefficient from a surface picked uniformly, then 
 `--joint_vel` weighs a penalty on the squared joint speeds of the imagined states (task.joint_vel), in imagination only. With a
 tracker policy, `--kl_bound <eps>` keeps the trained policy near the initial one: the loss gains kl_beta x max(0, KL - eps), KL
 being that between the two policies' action distributions on the imagined states, and with `--kl_beta_lr` the weight adapts
-by dual ascent (XSoma.imagine, XSoma.policy_update).
+by dual ascent (XSoma.imagine, XSoma.policy_update). With a tracker policy, `--symmetry` weighs the squared distance between the
+action for the left/right mirror image of an imagined state and the mirror image of the action for that state (tracker.mirror).
+`--start_share` starts a share of the episodes in another joint pose (`--start_joints name:lo:hi,...`, offsets from the default
+pose) and, with `--start_cmd`, with a command from given ranges (sim.Sim._fresh).
 
 The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
 one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
@@ -209,6 +212,15 @@ class Config:
     kl_beta_lr: float = 0.0  # with kl_bound, > 0: dual ascent on the weight after every accepted policy update, kl_beta <- max(0,
     #                          kl_beta + kl_beta_lr x clip(KL / eps - 1, -1, 1)): it grows while KL is above the bound and shrinks below
     #                          it, by at most kl_beta_lr per update (0: fixed weight)
+    symmetry: float = 0.0  # with init_tracker: weight of the mean squared distance between the action for the mirror image of an
+    #                        imagined state (its observation history and command) and the mirror image of the action for the state
+    #                        (tracker.mirror: left/right joints from tracker_meta's names and axes, M = diag(1, -1, 1)), on the inputs
+    #                        held constant as the anchor's, over the steps that count for the return (0: not computed)
+    start_share: float = 0.0  # share of the episodes (fresh, not on the rope) that start in the pose of start_joints (sim.Sim._fresh)
+    start_joints: str = ""  # with start_share: "name:lo:hi,...": every joint whose name contains `name` starts at its default
+    #                         position + U[lo, hi] rad (e.g. a stance a robot ends in after a particular start), the others as usual
+    start_cmd: str = ""  # with start_share: "lo:hi,lo:hi,lo:hi": those episodes' first command (vx, vy, wz) uniform in these ranges
+    #                      ("": drawn as any other)
     impact_accel: float = 0.0  # weight of the penalty task.impact_accel on the base's upward acceleration over a step (a proxy of
     #                            the ground force's peaks), in imagination's reward only and weighted as feet_cross is (0: not computed)
     support: float = 0.0  # share of the episodes that start with the robot on a rope that pulls its torso up (sim.Sim._support,
@@ -284,7 +296,8 @@ class XSoma:
                               cmd_scale=self.cmd_scale, push_vel=c.push_vel, support=c.support,
                               support_gap=tuple(float(x) for x in c.support_gap.split(",")),
                               support_point=tuple(float(x) for x in c.support_point.split(",")) if c.support_point else None,
-                              friction_surfaces=surfaces(c.friction_surfaces)))  # fmt: skip
+                              friction_surfaces=surfaces(c.friction_surfaces), start_share=c.start_share, start_joints=tuple(zip(*(x.tolist() for x in self.joint_ranges(c.start_joints)))) if c.start_share else None,
+                              start_cmd=tuple(tuple(float(x) for x in r.split(":")) for r in c.start_cmd.split(",")) if c.start_cmd else None))  # fmt: skip
         if c.foot_clearance or c.touchdown_speed or c.turn_step or c.walk_step:  # (2, k): the sole collider points of each foot; frames 2 and 3 are the ankle-roll links (sim.py)
             self.sole_foot = np.asarray(self.sim.sole_frame) == np.arange(2, 4)[:, None]
         self.ext = None  # --ext_joints: (the joints' indices, their lowest and their highest goal in rad)
@@ -293,11 +306,8 @@ class XSoma:
             assert spec and len({i for i, _, _ in spec}) == len(spec), f"--ext_joints {c.ext_joints}: no joint, or a joint twice"
             self.ext = tuple(np.asarray(x, t) for x, t in zip(zip(*spec), (int, np.float32, np.float32)))
             self.ext_q0, self.ext_scale = (np.broadcast_to(x, (task.J,))[self.ext[0]] for x in (task.DEFAULT_Q, task.ACTION_SCALE))
-        self.rng = None  # --range_joints: (the joints' indices, their lower and their upper bound in rad)
-        if c.range_penalty or c.range_target:
-            spec = [(i, float(lo), float(hi)) for name, lo, hi in (e.split(":") for e in c.range_joints.split(",")) for i, d in enumerate(task.DOF) if name in d]
-            assert spec and len({i for i, _, _ in spec}) == len(spec), f"--range_joints {c.range_joints}: no joint, or a joint twice"
-            self.rng = tuple(np.asarray(x, t) for x, t in zip(zip(*spec), (int, np.float32, np.float32)))
+        self.rng = self.joint_ranges(c.range_joints) if c.range_penalty or c.range_target else None  # --range_joints
+        self.mirror = tracker.mirror(c.tracker_meta) if c.symmetry else None  # --symmetry: (perm, sign) of the tracker's joints
         self.reward_cfg = self.sim.reward_cfg if c.gait_clock else dataclasses.replace(self.sim.reward_cfg, feet_phase=0.0)  # imagination's reward
         self.ckpt_extra = None  # a tracker policy: what save_ckpt writes besides the networks, the normalizers and the metadata as loaded
         if c.init_tracker:
@@ -309,6 +319,13 @@ class XSoma:
         J = self.J
         # error floors of the world-model loss for every state dimension: ERR_FLOOR's four groups, then q and qd
         self.err_floor = np.concatenate([np.full((n,), v, np.float32) for n, v in ERR_FLOOR] + [np.full((J,), 3e-3, np.float32), np.full((J,), 5e-2, np.float32)])
+
+    @staticmethod
+    def joint_ranges(spec_s):
+        """"name:lo:hi,..." (--range_joints, --start_joints) as (the joints' indices, their lower and their upper bound in rad)."""
+        spec = [(i, float(lo), float(hi)) for name, lo, hi in (e.split(":") for e in spec_s.split(",")) for i, d in enumerate(task.DOF) if name in d]
+        assert spec and len({i for i, _, _ in spec}) == len(spec), f"{spec_s}: no joint, or a joint twice"
+        return tuple(np.asarray(x, t) for x, t in zip(zip(*spec), (int, np.float32, np.float32)))
 
     @property
     def cmd_scale(self):
@@ -533,9 +550,11 @@ class XSoma:
         termination are read on the new state, then the gait phase advances and the command resamples every 500 steps. A tracker
         policy (`pi`: its encoder and decoder) acts as in tracker.step, on its noisy observation of the imagined state, the
         history and the commanded heading; with `pi0`, the initial tracker, the loss gains `anchor` times the mean squared distance
-        between the two policies' actions on the same inputs (held constant for it), over the steps that count for the return, and
-        with `kl_beta` (--kl_bound) kl_beta x max(0, KL - kl_bound), KL being that distance's mean over the same steps (weighted by
-        their survival, held constant) over 2 action_noise^2: the KL divergence of two Gaussians of that std around the actions."""
+        between the two policies' actions on the same inputs (held constant for it), over the steps that count for the return;
+        with --symmetry, `symmetry` times the same mean of |pi(mirrored inputs) - mirrored pi(inputs)|^2 (inputs held constant);
+        and with `kl_beta` (--kl_bound) kl_beta x max(0, KL - kl_bound), KL being the anchor's distance's mean over the same steps
+        (weighted by their survival, held constant) over 2 action_noise^2: the KL divergence of two Gaussians of that std around
+        the actions."""
         c, B = self.cfg, self.cfg.pi_batch
         bf16 = c.mm_bf16 in ("imag", "all")
         rcfg = self.reward_cfg
@@ -555,7 +574,7 @@ class XSoma:
         def step(carry, k):
             S, v, a_last, cmd, freq, phase, t, mem, ext, xi, st = carry
             k_o, k_c = jax.random.split(k)
-            pen = None
+            pen = sym = None
             if c.init_tracker:
                 prev, heading = mem  # the H - 1 observations before this step's, the commanded heading
                 seen = self.hide(ext_on, S[4], S[5], a_last, ext[3]) if ext is not None and c.ext_blind else (S[4], S[5], a_last)
@@ -565,12 +584,18 @@ class XSoma:
                 hist, g = jnp.concatenate((prev, o[:, None]), 1), tracker.goal(pi, cmd)
                 a = tracker.act(pi, hist, g, out_bf16=bf16)[:, pi["to_sim"]]
                 mem = (hist[:, 1:], heading + task.DT * cmd[:, 2])
+                # the anchor's and the symmetry's actions on the inputs as constants: through the rollout the penalty's gradient
+                # explodes (the distance then grows with its weight); as a regression at fixed inputs it pulls the weights back
+                fixed = jax.lax.stop_gradient(hist)
                 if pi0 is not None:
-                    # both actions on the inputs as constants: through the rollout the penalty's gradient explodes (the
-                    # distance then grows with its weight); as a regression at fixed inputs it pulls the weights back
-                    fixed = jax.lax.stop_gradient(hist)
                     a0 = tracker.act({**pi, **pi0}, fixed, g, out_bf16=bf16)
-                    pen = jnp.sum((tracker.act(pi, fixed, g, out_bf16=bf16) - a0) ** 2, -1)
+                if pi0 is not None or self.mirror is not None:
+                    a_fix = tracker.act(pi, fixed, g, out_bf16=bf16)
+                if pi0 is not None:
+                    pen = jnp.sum((a_fix - a0) ** 2, -1)
+                if self.mirror is not None:  # tracker order: the mirror map's
+                    a_m = tracker.act(pi, tracker.mirror_obs(self.mirror, fixed), tracker.goal(pi, cmd * tracker.MIRROR_CMD), out_bf16=bf16)
+                    sym = jnp.sum((a_m - a_fix[..., self.mirror[0]] * self.mirror[1]) ** 2, -1)
             else:
                 obs, _ = task.observations(v.robot, a_last, cmd, phase, k_o)
                 a = nets.pi_apply(pi, obs, out_bf16=bf16)
@@ -634,7 +659,7 @@ class XSoma:
                 top, rate = task.support_pay_out(xi[:, -2], xi[:, -1])
                 xi = jnp.concatenate((xi[:, :-2], top[:, None], rate[:, None]), -1)
                 cmd1 = jnp.where((top > task.SUPPORT_OFF)[:, None], 0.0, cmd1)
-            return (S1, v1, a, cmd1, freq1, phase1, t1, mem, ext, xi, st), (r, d, pen)
+            return (S1, v1, a, cmd1, freq1, phase1, t1, mem, ext, xi, st), (r, d, pen, sym)
 
         if c.imag_remat == "dots":
             step = jax.checkpoint(step, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
@@ -642,7 +667,7 @@ class XSoma:
             step = jax.checkpoint(step)
         mem = (start["hist"][:, :-1], start["heading"]) if c.init_tracker else None
         init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext, start["xi"], jnp.zeros((B, 2)))
-        _, (r, d, pen) = jax.lax.scan(step, init, keys, unroll=c.imag_unroll)
+        _, (r, d, pen, sym) = jax.lax.scan(step, init, keys, unroll=c.imag_unroll)
         alive = jnp.cumprod(1 - d, 0)
         alive_before = jnp.concatenate((jnp.ones_like(alive[:1]), alive[:-1]), 0)  # a step's reward counts if alive before it
         disc = c.gamma ** jnp.arange(c.horizon, dtype=jnp.float32)[:, None]
@@ -652,6 +677,9 @@ class XSoma:
         if pen is not None:
             anchor = (alive_before * pen).mean()
             loss, stats = loss + c.anchor * anchor, {**stats, "anchor": anchor}
+        if sym is not None:
+            sym = (alive_before * sym).mean()
+            loss, stats = loss + c.symmetry * sym, {**stats, "sym": sym}
         if kl_beta is not None:
             w = jax.lax.stop_gradient(alive_before)
             kl = (w * pen).sum() / jnp.maximum(w.sum(), 1.0) / (2 * c.action_noise**2)
@@ -722,7 +750,7 @@ class XSoma:
 
         def skip(sub):
             kl = ("kl", "kl_term") if "kl_beta" in carry else ()
-            st = {k: jnp.zeros((), jnp.float32) for k in ("G", "r", "surv", "gn", "gn_gated") + (("anchor",) if "pi0" in carry else ()) + kl}
+            st = {k: jnp.zeros((), jnp.float32) for k in ("G", "r", "surv", "gn", "gn_gated") + (("anchor",) if "pi0" in carry else ()) + (("sym",) if c.symmetry else ()) + kl}
             return sub, {**st, **({"kl_beta": sub["kl_beta"]} if kl else {})}
 
         active = carry["it"] >= c.wm_only_iters
@@ -793,6 +821,10 @@ def main(argv=None):
         "--walk_step, --balance, --balance_margin, --step_length, --step_base, --step_per_speed and --step_width are not negative"
     assert min(cfg.kl_bound, cfg.kl_beta, cfg.kl_beta_lr) >= 0 and (not cfg.kl_bound or (cfg.init_tracker and cfg.action_noise > 0)), \
         "--kl_bound, --kl_beta and --kl_beta_lr are not negative; --kl_bound needs --init_tracker and a positive --action_noise"
+    assert cfg.symmetry >= 0 and (cfg.init_tracker or not cfg.symmetry), "--symmetry is not negative and needs --init_tracker"
+    assert 0 <= cfg.start_share <= 1 and bool(cfg.start_share) == bool(cfg.start_joints) and (cfg.start_share or not cfg.start_cmd), \
+        "--start_share is a share and goes with --start_joints, --start_cmd needs them"
+    assert not cfg.start_cmd or len(cfg.start_cmd.split(",")) == 3, "--start_cmd is lo:hi for vx, vy and wz"
     surfaces(cfg.friction_surfaces)
     gap = [float(x) for x in cfg.support_gap.split(",")]
     assert 0 <= cfg.support <= 1 and len(gap) == 2 and gap[0] <= gap[1], "--support is a share, --support_gap is lo,hi in m"
