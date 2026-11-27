@@ -232,6 +232,7 @@ A robot other than the G1 is a directory with two files, given as `python train.
   bodies welded to their parent (no joint, no collider) with a nominal mass in the MJCF. Per env, once at start-up like the
   torso's, each body's mass (kg) and CoM (its own frame; y range mirrored for the second body) are drawn uniformly, its inertia
   scaled by mass / nominal mass; the context xi gets 4 more values per body (added mass, CoM offset).
+  Optional, `torso_added_mass`: `[lo, hi]` kg, the range of the torso's added mass (default the G1's `[-1, 3]`).
   Optional, `self_collision`: `[[body names of group A], [body names of group B]]` (one pair of groups, for example the two
   legs): every collider of an A body collides with every collider of a B body, none within a group, and the rest of the robot
   still with the terrain only. The simulator applies these contacts, but only terrain contacts end an episode.

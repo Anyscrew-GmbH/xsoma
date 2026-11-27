@@ -314,6 +314,13 @@ def turn_stance(st, sole_h):
     return ((sole_h < TURN_STEP_HEIGHT) + soft - jax.lax.stop_gradient(soft)) * (st + DT)
 
 
+def stance_clock(st, sole_h, keep):
+    """Collection's stance clocks (train.py --stance_carry): turn_stance's count on the real state (DT added for a foot whose lowest
+    sole point `sole_h` is under TURN_STEP_HEIGHT, zero for a higher one), and zero for both feet where `keep` (N,) is False (a
+    reset or a new command)."""
+    return jnp.where(keep[:, None], (sole_h < TURN_STEP_HEIGHT) * (st + DT), 0.0)
+
+
 def turn_step(st, wz, stance):
     """The step-rate penalty term, which is not Holosoma's (train.py --turn_step): |yaw-rate command| `wz` (N,) x the seconds by
     which each foot's stance `st` (N, 2; turn_stance) exceeds `stance`, summed over the feet. Turning asks each foot to lift at
@@ -469,7 +476,7 @@ MASS_BODIES = _robot("mass_bodies", ("pelvis", "left_hip_yaw_link", "left_hip_ro
                                     "right_hip_yaw_link", "right_hip_roll_link", "right_hip_pitch_link", "right_knee_link"))  # fmt: skip
 MASS_SCALE = (0.9, 1.2)  # the masses of MASS_BODIES times U, inertia scaled by the same ratio (setup only)
 TORSO = _robot("torso", "torso_link")  # the body of the next two
-TORSO_ADDED_MASS = (-1.0, 3.0)  # kg on torso_link (setup only)
+TORSO_ADDED_MASS = tuple(_ROBOT.get("torso_added_mass", (-1.0, 3.0))) if ROBOT_DIR else (-1.0, 3.0)  # kg on torso_link (setup only)
 TORSO_COM = 0.05  # +-m per axis on torso_link (setup only)
 FRICTION = (0.5, 1.25)  # range of the friction coefficient; each env gets one of 64 equally spaced values (setup only)
 FRICTION_BUCKETS = 64

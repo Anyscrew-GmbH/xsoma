@@ -2,7 +2,7 @@
 bodies added under the wrists: the loader accepts it and rejects a missing body, a jointed one, one with a collider and an
 unordered range; the start-up randomization draws each body's mass and CoM in its range (y mirrored for the second body), scales
 its inertia by the mass ratio and leaves every other draw as it is; the context grows by 4 entries per body, holding the added
-mass and the CoM offset. Runs on the CPU (the world's draws need no physics step).
+mass and the CoM offset. robot.json's optional `torso_added_mass` sets the torso's added-mass range. Runs on the CPU (the world's draws need no physics step).
 """
 
 import json
@@ -37,10 +37,11 @@ def probe():
     p = sim.payload
     f = lambda x: np.asarray(x).tolist()  # noqa: E731
     return {"xi": f(xi), "mass": f(w.body_mass[:, p]), "ipos": f(w.body_ipos[:, p]), "inertia": f(w.body_inertia[:, p]),
-            "friction": f(w.geom_friction[:, 0, 0]), "lo": f(task.PAYLOAD_LO), "hi": f(task.PAYLOAD_HI)}  # fmt: skip
+            "friction": f(w.geom_friction[:, 0, 0]), "lo": f(task.PAYLOAD_LO), "hi": f(task.PAYLOAD_HI),
+            "torso_add": f(w.body_mass[:, sim.torso] - sim.m.body_mass[sim.torso])}  # fmt: skip
 
 
-def robot_dir(d, payload=PAYLOAD, extra=""):
+def robot_dir(d, payload=PAYLOAD, extra="", values=None):
     """The G1 as a robot directory in d, with a welded payload body under each wrist (`extra` goes into the left one)."""
     from test_robot_dir import fingerprint
 
@@ -54,7 +55,7 @@ def robot_dir(d, payload=PAYLOAD, extra=""):
         xml = re.sub(rf'(<body name="{side}_wrist_yaw_link"[^>]*>)', lambda m: m.group(1) + body, xml, count=1)
     with open(os.path.join(d, "robot.xml"), "w") as f:
         f.write(xml)
-    values = fingerprint()["values"] | ({"payload": payload} if payload is not None else {})
+    values = fingerprint()["values"] | ({"payload": payload} if payload is not None else {}) | (values or {})
     with open(os.path.join(d, "robot.json"), "w") as f:
         json.dump(values, f)
     return d
@@ -79,11 +80,15 @@ def test_payload():
         print(f"rejected: {', '.join(bad)}")
 
         outs = {}
-        for name, payload in (("with", PAYLOAD), ("without", None)):
-            r = run(robot_dir(tempfile.mkdtemp(dir=root), payload))
+        for name, payload, values in (("with", PAYLOAD, None), ("without", None, None), ("torso", None, {"torso_added_mass": [-3.0, 4.0]})):
+            r = run(robot_dir(tempfile.mkdtemp(dir=root), payload, values=values))
             assert r.returncode == 0, r.stderr[-3000:]
             outs[name] = {k: np.asarray(v) for k, v in json.loads(r.stdout.splitlines()[-1]).items()}
-    a, b = outs["with"], outs["without"]
+    a, b, t = outs["with"], outs["without"], outs["torso"]
+    assert b["torso_add"].min() >= -1 - 1e-4 and b["torso_add"].max() <= 3 + 1e-4 and b["torso_add"].min() < -0.9, "default torso range"
+    assert t["torso_add"].min() >= -3 - 1e-4 and t["torso_add"].max() <= 4 + 1e-4 and t["torso_add"].min() < -2.8 and t["torso_add"].max() > 3.8
+    print(f"torso added mass: default {b['torso_add'].min():.2f} to {b['torso_add'].max():.2f} kg, robot.json [-3, 4]: "
+          f"{t['torso_add'].min():.2f} to {t['torso_add'].max():.2f} kg")
     nb = len(PAYLOAD[0]["bodies"])
 
     lo, hi = a["lo"], a["hi"]

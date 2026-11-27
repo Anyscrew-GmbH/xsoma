@@ -40,7 +40,9 @@ seventh entries of `--cmd_scale` scale a share of the commands down (slow comman
 `--touchdown_speed` weighs a penalty on a foot's downward speed lower than `--touchdown_height` over the terrain
 (task.touchdown_speed) and `--impact_accel` one on the base's upward acceleration (task.impact_accel), both in imagination only.
 `--turn_step` weighs a penalty, scaled by the yaw-rate command, on a foot that stands longer than `--turn_step_stance` seconds
-(task.turn_step; stance from the feet's heights in the imagined states), in imagination only. `--friction_surfaces lo:hi,...`
+(task.turn_step; stance from the feet's heights in the imagined states), in imagination only; with `--stance_carry 1` each imagined
+rollout starts its stance clocks from collection's (kept in the replay buffer) instead of zero, so a `--turn_step_stance` near or
+above the horizon's length can be reached. `--friction_surfaces lo:hi,...`
 draws each episode's friction coefficient from a surface picked uniformly, then uniformly in its range (sim.Sim._mu).
 `--joint_vel` weighs a penalty on the squared joint speeds of the imagined states (task.joint_vel), in imagination only. With a
 tracker policy, `--kl_bound <eps>` keeps the trained policy near the initial one: the loss gains kl_beta x max(0, KL - eps), KL
@@ -195,6 +197,9 @@ class Config:
     turn_step_stance: float = 0.4  # s
     walk_step: float = 0.0  # weight of the penalty task.walk_step (a foot's stance beyond turn_step_stance under any nonzero command),
     #                         in imagination's reward only and weighted as feet_cross is (0: not computed)
+    stance_carry: int = 0  # with turn_step or walk_step, 1: each imagined rollout starts its stance clocks from those of collection
+    #                        (each foot's stance under the current command, task.stance_clock; kept in the replay buffer; zero for a
+    #                        start whose command imagination redraws) instead of zero, which caps the stance it can see at the horizon
     balance: float = 0.0  # weight of the penalty task.balance (pelvis beyond balance_margin from the segment between the feet), in
     #                       imagination's reward only and weighted as feet_cross is (0: not computed)
     balance_margin: float = 0.03  # m
@@ -375,6 +380,9 @@ class XSoma:
             if c.ext_blind:  # own: the policy's own last action for those joints, which it is fed instead of the applied one
                 extra["ext"]["own"] = jnp.zeros_like(x)
                 rec_t["ext_own"] = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+        if c.stance_carry:  # stance: each foot's stance clock in collection, at the state an action is taken in
+            extra["stance"] = jnp.zeros((c.num_envs, 2))
+            rec_t["stance"] = jax.ShapeDtypeStruct((c.num_envs, 2), jnp.float32)
         # wm: network weights, wm_b: its normalizers; 12 + 2 J outputs: the changes of position, rotation, v, w (3 each), q, qd
         wm, wm_b = nets.wm_init(ks[2], self.wm_in, 12 + 2 * J, widths(c.wm_hidden))
         # Muon masks (Muon where True, Adam elsewhere): none for the policy, the hidden weight matrices for the world model
@@ -448,6 +456,11 @@ class XSoma:
                 rec["ext_own"] = own
         if c.init_tracker:  # the commanded heading of this step's observation (the memory holds the next step's)
             rec["heading"] = mem["heading"] - task.DT * s.cmd[:, 2]
+        if c.stance_carry:  # the clock at the state the action was taken in; then advanced on the state after the physics
+            rec["stance"] = carry["stance"]
+            v1 = self.sim.view_state(unflatten(tr.qpos1, tr.qvel1), s.world.heights)
+            keep = ~(tr.terminated | tr.truncated | (s1.cmd != s.cmd).any(-1))
+            carry = {**carry, "stance": task.stance_clock(carry["stance"], self.sole_low(v1), keep)}
         flat = rb.sanitize(rb.flatten(rec))
         flat["ok"] = flat["ok"] * (1 - tr.diverged.astype(jnp.float32))  # a physics failure is not a valid transition
         stats = {**stats, "nonfinite_env": 1 - flat["ok"].mean()}
@@ -537,6 +550,8 @@ class XSoma:
         start["cmd"] = jnp.where(fresh[:, None], cmd, start["cmd"])
         start["freq"] = jnp.where(fresh, freq, start["freq"])
         start["phase"] = jnp.where(fresh[:, None], task.gait_phase(start["t"], start["freq"], start["offset"], start["cmd"]), start["phase"])
+        if c.stance_carry:  # a new command starts the clocks again, as in collection
+            start["stance"] = jnp.where(fresh[:, None], 0.0, start["stance"])
         return start
 
     def termination(self, clearance):
@@ -683,7 +698,7 @@ class XSoma:
         elif c.imag_remat == "full":
             step = jax.checkpoint(step)
         mem = (start["hist"][:, :-1], start["heading"]) if c.init_tracker else None
-        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext, start["xi"], jnp.zeros((B, 2)))
+        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext, start["xi"], start["stance"] if c.stance_carry else jnp.zeros((B, 2)))
         _, (r, d, pen, sym) = jax.lax.scan(step, init, keys, unroll=c.imag_unroll)
         alive = jnp.cumprod(1 - d, 0)
         alive_before = jnp.concatenate((jnp.ones_like(alive[:1]), alive[:-1]), 0)  # a step's reward counts if alive before it
@@ -833,6 +848,7 @@ def main(argv=None):
     assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
     assert min(cfg.touchdown_speed, cfg.touchdown_height, cfg.impact_accel) >= 0, "--touchdown_speed, --touchdown_height and --impact_accel are not negative"
     assert cfg.turn_step >= 0 and cfg.turn_step_stance > 0, "--turn_step is not negative, --turn_step_stance is positive"
+    assert not cfg.stance_carry or cfg.turn_step or cfg.walk_step, "--stance_carry needs --turn_step or --walk_step"
     assert cfg.joint_vel >= 0, "--joint_vel is not negative"
     assert min(cfg.walk_step, cfg.balance, cfg.balance_margin, cfg.step_length, cfg.step_base, cfg.step_per_speed, cfg.step_width) >= 0, \
         "--walk_step, --balance, --balance_margin, --step_length, --step_base, --step_per_speed and --step_width are not negative"
