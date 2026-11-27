@@ -55,9 +55,9 @@ def start(config: dict, log_dir: str):
 OVERVIEW = {"reward", "ep_len", "avg_len", "surv", "term_env", "rew_tracking_lin_vel", "rew_tracking_ang_vel",  # fine-tuning
             "ep_ret", "sim_r", "term_frac"}  # imitation
 GROUPS = {"rewards": {"reward", "r", "sim_r", "ir", "ep_ret"},
-          "actor": {"G", "pi", "pi_lr", "gn", "gn_gated", "scale", "kl", "kl_term", "kl_beta", "support", "sym"},
+          "actor": {"G", "pi", "pi_lr", "gn", "gn_gated", "scale", "kl", "kl_term", "kl_beta", "support", "sym", "anchor"},
           "critic": {"v", "q"},
-          "world_model": {"wm", "wm8", "wm_gated", "h_err8", "h_errK", "term_wm", "diverged", "anchor"}}
+          "world_model": {"wm", "wm8", "wm_gated", "h_err8", "h_errK", "term_wm", "diverged"}}
 _last = None  # (wall seconds, steps) of the previous record, for steps per second
 
 
