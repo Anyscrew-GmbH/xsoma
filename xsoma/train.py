@@ -32,7 +32,12 @@ action-rate penalties leave them out. `--stand_still` weighs a penalty on any mo
 command (task.stand_still), in imagination only. A fourth entry of `--cmd_scale` is the share of zero commands. With
 `--ext_blind 1` a tracker policy is not shown those joints while they are driven from outside (`XSoma.hide`). `--track_l1`
 weighs a penalty on the plain distance between the command and the base's velocity (task.track_l1), in imagination only;
-`--track_rel` takes that distance relative to the command's size. `--torque_limit` weighs a penalty on the PD torque that an
+`--track_rel` takes that distance relative to the command's size. `--track_pos` weighs a penalty on the pelvis's planar
+displacement error, a leaky integral (time constant `--track_pos_tau`) of the commanded minus the actual velocity
+(task.track_pos), in imagination only; the error is kept in the replay buffer and imagined rollouts start from it. `--settle`
+weighs a penalty, under a zero command, on the feet's spacing and the pelvis's offset from their midpoint differing from the
+default pose's by more than `--settle_margin` (task.settle), in imagination only; with it `--stand_still` does not charge the
+feet's motion while that difference is larger than the margin. `--torque_limit` weighs a penalty on the PD torque that an
 imagined action asks for beyond `--torque_soft` x each joint's effort limit (task.torque_limit), in imagination only.
 `--range_penalty` weighs a penalty on the joints of `--range_joints name:lo:hi,...` outside those ranges (task.joint_range), in
 imagination only; `--range_target` weighs the same penalty on the PD targets that the imagined actions ask for. Sixth and
@@ -178,6 +183,14 @@ class Config:
     #                         at least this; not for a zero command), so that slow commands weigh as much as fast ones (0: off)
     stand_still: float = 0.0  # weight of the penalty task.stand_still on the base and the feet moving under a zero command, in
     #                           imagination's reward only and weighted as feet_cross is (0: not computed)
+    track_pos: float = 0.0  # weight of the penalty task.track_pos on the pelvis's planar displacement error (task.track_pos_error,
+    #                         kept in the replay buffer and carried into imagination; zero after a reset or a new command), in
+    #                         imagination's reward only and weighted as feet_cross is (0: not computed)
+    track_pos_tau: float = 1.0  # s: the time constant of the displacement error's leaky integral
+    track_pos_rel: float = 0.05  # m/s: the error is divided by tau x the planar command's size, taken as at least this
+    settle: float = 0.0  # weight of the penalty task.settle on the stance (feet's spacing, pelvis over their midpoint) differing from
+    #                      the default pose's under a zero command, in imagination's reward only and weighted as feet_cross is (0: not computed)
+    settle_margin: float = 0.03  # m: settle's free difference; with stand_still, a larger one waives stand_still's foot motion
     torque_limit: float = 0.0  # weight of the penalty task.torque_limit on the PD torque that the imagined action asks for beyond
     #                            torque_soft x the effort limit, in imagination's reward only and weighted as feet_cross is (0: not computed)
     torque_soft: float = 0.9  # with torque_limit: the share of the effort limit from which on the torque is penalized
@@ -383,6 +396,9 @@ class XSoma:
         if c.stance_carry:  # stance: each foot's stance clock in collection, at the state an action is taken in
             extra["stance"] = jnp.zeros((c.num_envs, 2))
             rec_t["stance"] = jax.ShapeDtypeStruct((c.num_envs, 2), jnp.float32)
+        if c.track_pos:  # track_d: the displacement error in collection, at the state an action is taken in
+            extra["track_d"] = jnp.zeros((c.num_envs, 2))
+            rec_t["track_d"] = jax.ShapeDtypeStruct((c.num_envs, 2), jnp.float32)
         # wm: network weights, wm_b: its normalizers; 12 + 2 J outputs: the changes of position, rotation, v, w (3 each), q, qd
         wm, wm_b = nets.wm_init(ks[2], self.wm_in, 12 + 2 * J, widths(c.wm_hidden))
         # Muon masks (Muon where True, Adam elsewhere): none for the policy, the hidden weight matrices for the world model
@@ -456,11 +472,15 @@ class XSoma:
                 rec["ext_own"] = own
         if c.init_tracker:  # the commanded heading of this step's observation (the memory holds the next step's)
             rec["heading"] = mem["heading"] - task.DT * s.cmd[:, 2]
-        if c.stance_carry:  # the clock at the state the action was taken in; then advanced on the state after the physics
-            rec["stance"] = carry["stance"]
+        if c.stance_carry or c.track_pos:  # the value at the state the action was taken in; then advanced on the state after the physics
             v1 = self.sim.view_state(unflatten(tr.qpos1, tr.qvel1), s.world.heights)
             keep = ~(tr.terminated | tr.truncated | (s1.cmd != s.cmd).any(-1))
+        if c.stance_carry:
+            rec["stance"] = carry["stance"]
             carry = {**carry, "stance": task.stance_clock(carry["stance"], self.sole_low(v1), keep)}
+        if c.track_pos:
+            rec["track_d"] = carry["track_d"]
+            carry = {**carry, "track_d": jnp.where(keep[:, None], task.track_pos_error(carry["track_d"], v1.robot, s.cmd, c.track_pos_tau), 0.0)}
         flat = rb.sanitize(rb.flatten(rec))
         flat["ok"] = flat["ok"] * (1 - tr.diverged.astype(jnp.float32))  # a physics failure is not a valid transition
         stats = {**stats, "nonfinite_env": 1 - flat["ok"].mean()}
@@ -552,6 +572,8 @@ class XSoma:
         start["phase"] = jnp.where(fresh[:, None], task.gait_phase(start["t"], start["freq"], start["offset"], start["cmd"]), start["phase"])
         if c.stance_carry:  # a new command starts the clocks again, as in collection
             start["stance"] = jnp.where(fresh[:, None], 0.0, start["stance"])
+        if c.track_pos:  # and the displacement error
+            start["track_d"] = jnp.where(fresh[:, None], 0.0, start["track_d"])
         return start
 
     def termination(self, clearance):
@@ -600,7 +622,7 @@ class XSoma:
             ext = (x, jax.random.uniform(k_g, x.shape, minval=lo, maxval=hi), task.EXT_SPEED * jax.random.uniform(k_s, x.shape), start.get("ext_own", 0 * x))
 
         def step(carry, k):
-            S, v, a_last, cmd, freq, phase, t, mem, ext, xi, st = carry
+            S, v, a_last, cmd, freq, phase, t, mem, ext, xi, st, dp = carry
             k_o, k_c = jax.random.split(k)
             pen = sym = None
             if c.init_tracker:
@@ -641,8 +663,14 @@ class XSoma:
                 r = task.reward(task.reward_terms(rb, v1.foot_h, jnp.where(ext_j, 0.0, a), jnp.where(ext_j, 0.0, a_last), cmd, phase), rcfg, scale)
             if c.track_l1:  # weighted as task.weighted weighs a penalty
                 r = r - task.DT * c.track_l1 * scale * task.track_l1(v1.robot, cmd, c.track_rel)
-            if c.stand_still:  # weighted as task.weighted weighs a penalty
-                r = r - task.DT * c.stand_still * scale * task.stand_still(v1.robot, v1.robot.foot_p - v.robot.foot_p, cmd)
+            if c.track_pos:  # weighted as task.weighted weighs a penalty; the error advanced on the state the step ends in
+                dp = task.track_pos_error(dp, v1.robot, cmd, c.track_pos_tau)
+                r = r - task.DT * c.track_pos * scale * task.track_pos(dp, cmd, c.track_pos_tau, c.track_pos_rel)
+            if c.settle:  # weighted as task.weighted weighs a penalty; the state the step ends in
+                r = r - task.DT * c.settle * scale * task.settle(v1.robot, cmd, stance0, c.settle_margin)
+            if c.stand_still:  # weighted as task.weighted weighs a penalty; with settle, a step from a stance off the default is free
+                feet = (jax.lax.stop_gradient(task.stance_error(v.robot, stance0)) <= c.settle_margin) if c.settle else 1.0
+                r = r - task.DT * c.stand_still * scale * task.stand_still(v1.robot, v1.robot.foot_p - v.robot.foot_p, cmd, feet)
             if c.feet_cross:  # weighted as task.weighted weighs a penalty
                 r = r - task.DT * c.feet_cross * scale * task.feet_cross(v1.robot)
             if c.foot_clearance:  # weighted as task.weighted weighs a penalty
@@ -691,14 +719,20 @@ class XSoma:
                 top, rate = task.support_pay_out(xi[:, -2], xi[:, -1])
                 xi = jnp.concatenate((xi[:, :-2], top[:, None], rate[:, None]), -1)
                 cmd1 = jnp.where((top > task.SUPPORT_OFF)[:, None], 0.0, cmd1)
-            return (S1, v1, a, cmd1, freq1, phase1, t1, mem, ext, xi, st), (r, d, pen, sym)
+            if c.track_pos:  # a new command starts the error again, as in collection
+                dp = jnp.where((cmd1 != cmd).any(-1)[:, None], 0.0, dp)
+            return (S1, v1, a, cmd1, freq1, phase1, t1, mem, ext, xi, st, dp), (r, d, pen, sym)
 
         if c.imag_remat == "dots":
             step = jax.checkpoint(step, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         elif c.imag_remat == "full":
             step = jax.checkpoint(step)
         mem = (start["hist"][:, :-1], start["heading"]) if c.init_tracker else None
-        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext, start["xi"], start["stance"] if c.stance_carry else jnp.zeros((B, 2)))
+        if c.settle:  # the default pose's stance_offsets, pelvis at the origin
+            z = jnp.zeros((1, 3))
+            stance0 = task.stance_offsets(self.sim.view_state((z, jnp.eye(3)[None], z, z, jnp.asarray(task.DEFAULT_Q)[None], jnp.zeros((1, self.J))), heights).robot)[0]
+        init = (S0, self.sim.view_state(S0, heights), start["a_last"], start["cmd"], start["freq"], start["phase"], start["t"], mem, ext, start["xi"],
+                start["stance"] if c.stance_carry else jnp.zeros((B, 2)), start["track_d"] if c.track_pos else jnp.zeros((B, 2)))
         _, (r, d, pen, sym) = jax.lax.scan(step, init, keys, unroll=c.imag_unroll)
         alive = jnp.cumprod(1 - d, 0)
         alive_before = jnp.concatenate((jnp.ones_like(alive[:1]), alive[:-1]), 0)  # a step's reward counts if alive before it
@@ -845,6 +879,8 @@ def main(argv=None):
         "--range_penalty and --range_target are not negative, either goes with --range_joints"
     assert min(cfg.track_l1, cfg.stand_still) >= 0 and (not cfg.ext_blind or (cfg.ext_joints and cfg.init_tracker)), "--track_l1 is not negative, --ext_blind needs --ext_joints and --init_tracker"
     assert cfg.track_rel >= 0 and (cfg.track_l1 or not cfg.track_rel), "--track_rel is not negative and needs --track_l1"
+    assert min(cfg.track_pos, cfg.track_pos_rel, cfg.settle, cfg.settle_margin) >= 0 and cfg.track_pos_tau > 0, \
+        "--track_pos, --track_pos_rel, --settle and --settle_margin are not negative, --track_pos_tau is positive"
     assert cfg.torque_limit >= 0 and cfg.torque_soft > 0, "--torque_limit is not negative, --torque_soft is positive"
     assert min(cfg.touchdown_speed, cfg.touchdown_height, cfg.impact_accel) >= 0, "--touchdown_speed, --touchdown_height and --impact_accel are not negative"
     assert cfg.turn_step >= 0 and cfg.turn_step_stance > 0, "--turn_step is not negative, --turn_step_stance is positive"

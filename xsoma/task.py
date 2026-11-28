@@ -257,12 +257,13 @@ def foot_clearance(sole_h, step_xy, height=FOOT_CLEARANCE_HEIGHT):
     return jnp.sum(jnp.maximum(0.0, height - sole_h) * speed, -1)
 
 
-def stand_still(robot: Robot, feet_step, cmd):
+def stand_still(robot: Robot, feet_step, cmd, feet=1.0):
     """The standing penalty term, which is not Holosoma's (train.py --stand_still): under a zero command, the base's planar speed
-    (m/s) plus its angular speed (rad/s) plus the speed of each foot contact point, from its displacement `feet_step` (N, 2, 3)
-    in one policy step (m/s); zero under any other command. Norms, not squares: a slow drift is pulled to zero as hard as a step."""
+    (m/s) plus its angular speed (rad/s) plus `feet` (N,) times the speed of each foot contact point, from its displacement
+    `feet_step` (N, 2, 3) in one policy step (m/s); zero under any other command. Norms, not squares: a slow drift is pulled to
+    zero as hard as a step."""
     norm = lambda x: jnp.sqrt(jnp.sum(jnp.square(x), -1) + 1e-12)  # noqa: E731  (the 1e-12 keeps the gradient finite at rest)
-    return jnp.where((jnp.abs(cmd) < 0.01).all(-1), norm(robot.v[:, :2]) + norm(robot.w) + norm(feet_step).sum(-1) / DT, 0.0)
+    return jnp.where((jnp.abs(cmd) < 0.01).all(-1), norm(robot.v[:, :2]) + norm(robot.w) + feet * norm(feet_step).sum(-1) / DT, 0.0)
 
 
 def track_l1(robot: Robot, cmd, rel=0.0):
@@ -358,6 +359,51 @@ def step_length(robot: Robot, cmd, base, per_speed, width):
     ex = jnp.maximum(0.0, jnp.abs(fx) - base - per_speed * jnp.abs(cmd[:, 0]))
     ey = jnp.maximum(0.0, jnp.abs(fy) - width - base - per_speed * jnp.abs(cmd[:, 1]))
     return jnp.square(ex) + jnp.square(ey)
+
+
+def heading_xy(R, x):
+    """The planar components of world vectors `x` (N, 2 or 3) in the frame of the pelvis heading (the yaw of its rotation `R`). (N, 2)"""
+    yaw = jnp.arctan2(R[:, 1, 0], R[:, 0, 0])
+    c, s = jnp.cos(yaw), jnp.sin(yaw)
+    return jnp.stack((c * x[:, 0] + s * x[:, 1], c * x[:, 1] - s * x[:, 0]), -1)
+
+
+def track_pos_error(d, robot: Robot, cmd, tau):
+    """The displacement error (N, 2) one policy step on (train.py --track_pos): the leaky integral, with time constant `tau` (s), of
+    the commanded minus the pelvis's planar velocity in the heading frame, exp(-DT / tau) d + (cmd_xy - v_xy) DT (m): how far the
+    pelvis lags behind (or runs ahead of) the displacement that the command asked for over about the last `tau` seconds. A pause
+    between two steps adds to it only until the next step makes the distance up."""
+    return jnp.exp(-DT / tau) * d + (cmd[:, :2] - heading_xy(robot.R, robot.v)) * DT
+
+
+def track_pos(d, cmd, tau, rel):
+    """The displacement tracking penalty term, which is not Holosoma's (train.py --track_pos): the size of the displacement error
+    `d` (track_pos_error) over the displacement that a steady command asks for in `tau` seconds, tau x |cmd_xy| (taken as at least
+    tau x `rel`; tau x 1 m/s under a zero planar command, so a plain error in m/s as track_l1's). Standing still under a steady
+    command costs 1 after a few tau, as track_l1 with rel does; walking it in bursts with pauses costs only the bursts' ripple."""
+    size = lambda x: jnp.sqrt(jnp.sum(jnp.square(x), -1) + 1e-12)  # noqa: E731
+    n = size(cmd[:, :2])
+    return size(d) / (tau * jnp.where(n < 0.01, 1.0, jnp.maximum(n, rel)))
+
+
+def stance_offsets(robot: Robot):
+    """(N, 4) in the pelvis heading's frame (m): the left foot's contact point minus the right one's (x, y), then the pelvis minus
+    the midpoint of the two (x, y)."""
+    f = robot.foot_p[:, :, :2]
+    return jnp.concatenate((heading_xy(robot.R, f[:, 0] - f[:, 1]), heading_xy(robot.R, robot.p[:, :2] - f.mean(1))), -1)
+
+
+def stance_error(robot: Robot, ref):
+    """How far (m) the stance_offsets of `robot` lie from `ref` (4,), those of the default pose: the norm of the difference of the
+    feet's spacing (fore-aft and lateral) and of the pelvis's offset from their midpoint. (N,)"""
+    return jnp.sqrt(jnp.sum(jnp.square(stance_offsets(robot) - ref), -1) + 1e-12)
+
+
+def settle(robot: Robot, cmd, ref, margin):
+    """The settle penalty term, which is not Holosoma's (train.py --settle): under a zero command, stance_error beyond `margin`,
+    max(0, stance_error - margin) (m); zero under any other command. A split or staggered stance after a stop, or a pelvis left
+    off the feet's middle, costs as long as it lasts, so a corrective step that restores the stance pays off."""
+    return jnp.where((jnp.abs(cmd) < 0.01).all(-1), jnp.maximum(0.0, stance_error(robot, ref) - margin), 0.0)
 
 
 def lateral_tilt(Rb, R):
